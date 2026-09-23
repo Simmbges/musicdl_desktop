@@ -4,13 +4,14 @@ import json
 from pathlib import Path
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import Mock, patch
 import ssl
 import urllib.error
 import wave
 import tkinter as tk
-from backend import download, Cancelled, lossless, qq_catalog_row, search, DEFAULT_REPO
+from backend import download, Cancelled, lossless, qq_catalog_row, qq_catalog_search, resolve_catalog_song, search, DEFAULT_REPO
 
 
 def wav_bytes():
@@ -97,14 +98,36 @@ class Checks(unittest.TestCase):
         self.assertFalse(lossless({'ext': 'mp3'}))
 
     def test_qq_catalog_row_exposes_unavailable_lossless(self):
-        row = qq_catalog_row({'title': '晴天', 'mid': 'song-mid', 'interval': 269,
-            'singer': [{'name': '周杰伦'}], 'album': {'title': '叶惠美'},
+        row = qq_catalog_row({'title': '<em>晴天</em>', 'mid': 'song-mid', 'interval': 269,
+            'singer': [{'name': '<em>周杰伦</em>'}], 'album': {'title': '<em>叶惠美</em> &amp; 精选'},
             'file': {'size_flac': 55397039, 'size_new': []}, 'pay': {'pay_play': 1}})
         self.assertEqual(row['song_name'], '晴天')
+        self.assertEqual(row['singers'], '周杰伦')
+        self.assertEqual(row['album'], '叶惠美 & 精选')
         self.assertEqual(row['duration'], '04:29')
         self.assertTrue(row['catalog_lossless'])
         self.assertTrue(row['requires_rights'])
         self.assertFalse(row['downloadable'])
+        self.assertEqual(row['catalog_item']['mid'], 'song-mid')
+
+    def test_qq_catalog_limit_is_independent_and_restored(self):
+        class Response:
+            def json(self):
+                return {'music.search.SearchCgiService.DoSearchForQQMusicMobile': {'data': {'body': {'item_song': [
+                    {'title': f'歌曲{i}', 'mid': str(i), 'file': {}} for i in range(10)
+                ]}}}}
+        class Client:
+            search_size_per_source = 3
+            search_size_per_page = 3
+            def _constructsearchurls(self, keyword, request_overrides):
+                self.seen_limits = (self.search_size_per_source, self.search_size_per_page)
+                return [{'url': 'https://example.test', 'page_no': 1}]
+            def post(self, url, **kwargs): return Response()
+        client = Client()
+        rows = qq_catalog_search(client, '测试', 10)
+        self.assertEqual(client.seen_limits, (10, 10))
+        self.assertEqual((client.search_size_per_source, client.search_size_per_page), (3, 3))
+        self.assertEqual(len(rows), 10)
 
     def test_window_and_events(self):
         from app import App
@@ -112,7 +135,7 @@ class Checks(unittest.TestCase):
         root.withdraw()
         app = App(root)
         song = self.song()
-        app.events.put(('source', ('测试', [song], '1 首')))
+        app.events.put(('source', ('酷我', [song], '1 首')))
         app.poll()
         root.update()
         self.assertEqual(len(app.table.get_children()), 1)
@@ -120,6 +143,24 @@ class Checks(unittest.TestCase):
         app.only_lossless.set(True)
         app.render()
         self.assertEqual(len(app.table.get_children()), 1)
+        app.only_lossless.set(False)
+        catalog = qq_catalog_row({'title': '目录歌曲', 'mid': 'catalog-mid', 'file': {'size_flac': 1234}})
+        app.events.put(('source_partial', ('QQ音乐', [catalog], '1 首目录结果')))
+        app.poll()
+        self.assertEqual(len(app.table.get_children()), 2)
+        app.events.put(('source', ('QQ音乐', [], '超时，请稍后重试')))
+        app.poll()
+        self.assertEqual(len(app.table.get_children()), 2)
+        self.assertEqual(app.source_rows['QQ音乐'][0]['identifier'], 'catalog-mid')
+        self.assertIn('链接解析失败', app.source_status['QQ音乐'])
+        app.events.put(('source', ('QQ音乐', [dict(song, source='QQ音乐')], '1 首可下载')))
+        app.poll()
+        self.assertEqual(len(app.table.get_children()), 2)
+        app.events.put(('source', ('咪咕', [], '不可用：测试')))
+        app.events.put(('source', ('咪咕', [], '不可用：测试')))
+        app.poll()
+        self.assertEqual(app.source_health['咪咕']['failures'], 2)
+        self.assertGreater(app.source_health['咪咕']['cooldown_until'], time.monotonic())
         failed = app.queue_table.insert('', 'end', values=('失败歌曲', '失败', 'HTTP Error 403'))
         app.download_meta[failed] = dict(song_name='失败歌曲', singers='歌手', source='酷我', ext='flac')
         report = app.failure_report()
@@ -128,19 +169,32 @@ class Checks(unittest.TestCase):
         self.assertNotIn('download_url', report)
         app.copy_failures()
         root.update()
-        self.assertEqual(root.clipboard_get(), report)
+        copied = root.clipboard_get()
+        self.assertIn('失败数量：1', copied)
+        self.assertIn('错误：HTTP Error 403', copied)
         root.destroy()
 
 
 if __name__ == '__main__':
     import sys
-    if '--qq-live' in sys.argv:
-        candidates = []
+    if '--qq-fast-live' in sys.argv:
+        final_rows, started = [], time.monotonic()
+        def emit_fast(kind, data):
+            source, songs, status = data
+            print(f'{time.monotonic() - started:.1f}秒', kind, status, len(songs), flush=True)
+            if kind == 'source': final_rows.extend(songs)
+        search(DEFAULT_REPO, ['QQ音乐'], '晴天 周杰伦', 3, threading.Event(), emit_fast, timeout=45, catalog_limit=10)
+        target = next((song for song in final_rows if not song.get('downloadable')), None)
+        if not target: raise RuntimeError('未找到待按需解析的 QQ 目录结果')
+        resolved = resolve_catalog_song(DEFAULT_REPO, target, threading.Event(), timeout=45)
+        print('按需解析成功', resolved['song_name'], resolved['ext'], resolved['file_size'], flush=True)
+    elif '--qq-live' in sys.argv:
+        candidates, started = [], time.monotonic()
         def emit_qq(kind, data):
             source, songs, status = data
             candidates.extend(songs)
-            print(source, status, [(s.get('song_name'), s.get('ext'), s.get('file_size'), s.get('downloadable')) for s in songs], flush=True)
-        search(DEFAULT_REPO, ['QQ音乐'], '晴天 周杰伦', 3, threading.Event(), emit_qq, timeout=90)
+            print(f'{time.monotonic() - started:.1f}秒', kind, source, status, [(s.get('song_name'), s.get('ext'), s.get('file_size'), s.get('downloadable')) for s in songs], flush=True)
+        search(DEFAULT_REPO, ['QQ音乐'], '晴天 周杰伦', 3, threading.Event(), emit_qq, timeout=45, catalog_limit=10)
         target = next((song for song in candidates if song.get('downloadable') and lossless(song)), None)
         if not target:
             raise RuntimeError('未找到 QQ 可下载无损测试结果')

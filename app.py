@@ -1,4 +1,5 @@
 """拾音 · musicdl 桌面版。"""
+import copy
 import ctypes
 from datetime import datetime
 import json
@@ -9,10 +10,11 @@ from pathlib import Path
 import queue
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-from backend import ROOT, DEFAULT_REPO, SOURCES, lossless, search, download, Cancelled
+from backend import ROOT, DEFAULT_REPO, SOURCES, lossless, search, resolve_catalog_song, download, Cancelled
 
 
 class App:
@@ -22,9 +24,15 @@ class App:
         self.cancel = threading.Event()
         self.busy = False
         self.rows = []
+        self.source_rows = {}
         self.tasks = {}
         self.download_meta = {}
         self.source_status = {}
+        self.source_health = {}
+        self.source_started = {}
+        self.search_cache = {}
+        self.active_search_key = None
+        self.operation = None
         self.settings_path = ROOT / 'settings.json'
         try: settings = json.loads(self.settings_path.read_text('utf-8'))
         except (OSError, ValueError): settings = {}
@@ -32,6 +40,8 @@ class App:
         self.directory = tk.StringVar(value=settings.get('directory', str(ROOT / '下载音乐')))
         self.query = tk.StringVar()
         self.only_lossless = tk.BooleanVar(value=False)
+        self.search_mode = tk.StringVar(value=settings.get('search_mode', '快速搜索'))
+        self.mode_help = tk.StringVar()
         self.status = tk.StringVar(value='输入歌名或歌手，开始寻找你的下一首收藏。')
         self.count = tk.StringVar(value='尚未搜索')
         root.title('拾音 · 无损音乐桌面版')
@@ -79,11 +89,15 @@ class App:
         filters = ttk.Frame(body)
         filters.pack(fill='x', pady=(0, 8))
         ttk.Checkbutton(filters, text='仅显示无损', variable=self.only_lossless, command=self.render).pack(side='left')
+        self.mode = ttk.Combobox(filters, textvariable=self.search_mode, values=['快速搜索', '完整搜索'], state='readonly', width=9)
+        self.mode.pack(side='left', padx=(20, 6))
+        self.mode.bind('<<ComboboxSelected>>', lambda _: self.update_mode_help())
         ttk.Label(filters, text='每个音源最多').pack(side='left', padx=(20, 5))
-        self.limit = ttk.Combobox(filters, values=['10', '20', '30'], state='readonly', width=4)
-        self.limit.set('10')
+        self.limit = ttk.Combobox(filters, values=['5', '10', '20', '30'], state='readonly', width=4)
+        self.limit.set(str(settings.get('limit', '10')))
         self.limit.pack(side='left')
-        ttk.Label(filters, text='首  ·  无损优先排列').pack(side='left', padx=6)
+        ttk.Label(filters, text='首').pack(side='left', padx=(6, 14))
+        ttk.Label(filters, textvariable=self.mode_help, foreground='#60747c').pack(side='left')
         ttk.Label(filters, textvariable=self.count).pack(side='right')
         self.table = self.make_table(body, ['歌曲', '歌手', '专辑', '音质 / 格式', '时长', '大小', '来源'], [250, 160, 180, 120, 75, 85, 90], height=8)
         self.table.tag_configure('lossless', foreground='#087566')
@@ -115,6 +129,7 @@ class App:
         root.protocol('WM_DELETE_WINDOW', self.close)
         root.after(100, self.poll)
         self.entry.focus_set()
+        self.update_mode_help()
 
     def make_table(self, parent, names, widths, height, expand=True):
         frame = ttk.Frame(parent)
@@ -130,7 +145,9 @@ class App:
         return table
 
     def save_settings(self):
-        data = dict(repo=self.repo, directory=self.directory.get(), sources=[s for s, v in self.source_vars.items() if v.get()])
+        data = dict(repo=self.repo, directory=self.directory.get(),
+            sources=[s for s, v in self.source_vars.items() if v.get()],
+            search_mode=self.search_mode.get(), limit=self.limit.get())
         temporary = self.settings_path.with_suffix('.tmp')
         temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), 'utf-8')
         temporary.replace(self.settings_path)
@@ -198,9 +215,10 @@ class App:
         self.download_button.configure(state='disabled' if value else 'normal')
         self.cancel_button.configure(state='normal' if value else 'disabled')
 
-    def launch(self, job):
+    def launch(self, job, operation):
         self.cancel.clear()
         self.set_busy(True)
+        self.operation = operation
         def worker():
             try: job()
             except Exception as exc: self.events.put(('error', str(exc)))
@@ -218,15 +236,50 @@ class App:
             messagebox.showerror('未找到 musicdl', '请点击“项目位置”选择下载的 musicdl-master 文件夹。')
             return
         self.save_settings()
+        mode, catalog_limit = self.search_mode.get(), int(self.limit.get())
+        resolve_limit = min(5, catalog_limit) if mode == '快速搜索' else catalog_limit
+        cache_key = (str(Path(self.repo).resolve()), keyword.casefold(), tuple(sources), mode, catalog_limit)
+        cached = self.search_cache.get(cache_key)
+        if cached and time.monotonic() - cached[0] < 15 * 60:
+            self.source_rows = copy.deepcopy(cached[1])
+            self.source_status = dict(cached[2])
+            self.rebuild_rows()
+            self.update_sources()
+            self.status.set('已使用 15 分钟内的搜索缓存；需要刷新时切换模式或更改关键词。')
+            return
+        now = time.monotonic()
+        active_sources, skipped = [], []
+        for source in sources:
+            health = self.source_health.get(source, {})
+            if mode == '快速搜索' and health.get('cooldown_until', 0) > now:
+                skipped.append(source)
+            else:
+                active_sources.append(source)
+        if not active_sources:
+            active_sources = sources[:1]
+            skipped = sources[1:]
+        self.source_rows = {}
         self.rows.clear()
         self.render()
-        self.source_status = {s: '搜索中' for s in sources}
+        self.source_status = {s: ('近期连续失败，快速模式暂时跳过' if s in skipped else '等待搜索') for s in sources}
+        self.source_started = {s: time.monotonic() for s in active_sources}
+        self.active_search_key = cache_key
         self.update_sources()
-        self.status.set('正在搜索，各音源完成后陆续显示；单音源最多等待 90 秒。')
+        timeout = 45 if mode == '快速搜索' else 90
+        self.status.set(f'{mode}中：QQ 目录结果会先显示；每个音源最多等待 {timeout} 秒。')
         self.progress.configure(mode='indeterminate')
         self.progress.start(12)
-        repo, limit = self.repo, int(self.limit.get())
-        self.launch(lambda: search(repo, sources, keyword, limit, self.cancel, lambda kind, payload: self.events.put((kind, payload))))
+        self.launch(lambda: search(self.repo, active_sources, keyword, resolve_limit, self.cancel,
+            lambda kind, payload: self.events.put((kind, payload)), timeout=timeout,
+            catalog_limit=catalog_limit), 'search')
+
+    def update_mode_help(self):
+        text = '先解析 5 首 · 单源 45 秒 · 自动跳过近期失败源' if self.search_mode.get() == '快速搜索' else '解析全部结果 · 单源 90 秒'
+        self.mode_help.set(text)
+
+    def rebuild_rows(self):
+        self.rows = [song for source in SOURCES for song in self.source_rows.get(source, [])]
+        self.render()
 
     def render(self):
         self.table.delete(*self.table.get_children())
@@ -254,12 +307,10 @@ class App:
         if not selected:
             messagebox.showinfo('选择歌曲', '请先选中需要下载的歌曲。')
             return
-        songs = [song for song in selected if song.get('downloadable', True)]
+        songs = [song for song in selected if song.get('downloadable', True) or song.get('catalog_item')]
         if not songs:
-            messagebox.showinfo('暂无可用下载', 'QQ 已找到歌曲，但当前没有可下载直链。目录标注有 FLAC 不代表未登录账号可以下载；请改选其他音源。')
+            messagebox.showinfo('暂无可用下载', '选中的目录结果缺少按需解析信息，请重新搜索或改选其他音源。')
             return
-        if len(songs) != len(selected):
-            self.status.set(f'已跳过 {len(selected) - len(songs)} 首仅有目录信息的歌曲。')
         directory = self.directory.get().strip()
         if not directory:
             self.choose_directory()
@@ -280,27 +331,51 @@ class App:
                     continue
                 self.events.put(('task', (key, '下载中', '正在连接…')))
                 try:
+                    current = song
+                    if not song.get('downloadable', True):
+                        self.events.put(('task', (key, '解析中', '正在按需解析 QQ 下载地址…')))
+                        current = resolve_catalog_song(self.repo, song, self.cancel, timeout=45)
+                        self.download_meta[key] = current
+                        self.events.put(('task', (key, '下载中', '解析成功，正在连接…')))
                     def progress(done, total): self.events.put(('progress', (key, done, total)))
-                    path = download(song, directory, self.cancel, progress)
-                    note = song.pop('_download_note', '')
+                    path = download(current, directory, self.cancel, progress)
+                    note = current.pop('_download_note', '')
                     detail = str(path) + (f' · {note}' if note else '')
                     self.events.put(('task', (key, '已完成', detail)))
                 except Cancelled:
                     self.events.put(('task', (key, '已取消', '临时文件已清理')))
                 except Exception as exc:
                     self.events.put(('task', (key, '失败', str(exc))))
-        self.launch(job)
+        self.launch(job, 'download')
 
     def poll(self):
         for _ in range(200):
             try: kind, data = self.events.get_nowait()
             except queue.Empty: break
-            if kind == 'source':
+            if kind == 'source_partial':
                 source, songs, status = data
-                self.rows.extend(songs)
+                self.source_rows[source] = songs
                 self.source_status[source] = status
                 self.update_sources()
-                self.render()
+                self.rebuild_rows()
+            elif kind == 'source':
+                source, songs, status = data
+                elapsed = time.monotonic() - self.source_started.get(source, time.monotonic())
+                failed = status.startswith('不可用') or status.startswith('超时') or status.startswith('搜索进程退出')
+                health = self.source_health.setdefault(source, {'failures': 0, 'cooldown_until': 0})
+                if failed:
+                    health['failures'] += 1
+                    if health['failures'] >= 2: health['cooldown_until'] = time.monotonic() + 10 * 60
+                else:
+                    health.update(failures=0, cooldown_until=0)
+                existing = self.source_rows.get(source, [])
+                if source == 'QQ音乐' and failed and not songs and existing:
+                    songs = existing
+                    status = f'{len(existing)} 首目录结果 · 链接解析失败，双击下载时可重试'
+                self.source_rows[source] = songs
+                self.source_status[source] = f'{status} · {elapsed:.1f} 秒'
+                self.update_sources()
+                self.rebuild_rows()
             elif kind == 'task':
                 key, state, detail = data
                 self.queue_table.set(key, 1, state)
@@ -316,7 +391,14 @@ class App:
             elif kind == 'done':
                 self.progress.stop()
                 self.set_busy(False)
-                self.status.set('任务已取消。' if self.cancel.is_set() else '任务结束。搜索详情见音源状态；下载结果见记录中的“已完成 / 失败”。')
+                if self.operation == 'search' and self.active_search_key and not self.cancel.is_set():
+                    self.search_cache[self.active_search_key] = (time.monotonic(), copy.deepcopy(self.source_rows), dict(self.source_status))
+                    if len(self.search_cache) > 10:
+                        oldest = min(self.search_cache, key=lambda key: self.search_cache[key][0])
+                        self.search_cache.pop(oldest, None)
+                self.active_search_key = None
+                self.status.set('任务已取消。' if self.cancel.is_set() else '任务结束。搜索结果已缓存 15 分钟；下载结果见下方记录。')
+                self.operation = None
         self.root.after(100, self.poll)
 
     def close(self):

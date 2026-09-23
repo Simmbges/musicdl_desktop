@@ -1,5 +1,6 @@
 """musicdl adapter and cancellable, verified HTTP downloads."""
 import contextlib
+import html
 import io
 import multiprocessing as mp
 import os
@@ -22,6 +23,8 @@ SOURCES = {'网易云': 'NeteaseMusicClient', 'QQ音乐': 'QQMusicClient',
            '咪咕': 'MiguMusicClient', '千千': 'QianqianMusicClient',
            '街声': 'StreetVoiceMusicClient', 'ccMixter': 'CCMixterMusicClient'}
 LOSSLESS = {'flac', 'wav', 'alac', 'ape', 'wv', 'tta', 'dsf', 'dff', 'aiff'}
+SOURCE_PRIORITY = {'酷我': 0, '网易云': 1, '酷狗': 2, 'QQ音乐': 3,
+                   '咪咕': 4, '千千': 5, '街声': 6, 'ccMixter': 7}
 
 
 def lossless(song):
@@ -30,38 +33,49 @@ def lossless(song):
 
 def qq_catalog_row(item):
     """Convert a QQ search item to a visible, non-downloadable catalog row."""
+    def clean_text(value):
+        return html.unescape(re.sub(r'<[^>]+>', '', str(value or ''))).strip()
+
     file_info = item.get('file') or {}
     def numeric_size(value):
         try: return int(value or 0)
         except (TypeError, ValueError): return 0
     lossless_bytes = max((numeric_size(file_info.get(key)) for key in ('size_flac', 'size_hires', 'size_new')), default=0)
-    singers = ', '.join(singer.get('name', '') for singer in (item.get('singer') or []) if singer.get('name'))
+    singers = ', '.join(clean_text(singer.get('name')) for singer in (item.get('singer') or []) if singer.get('name'))
     album = item.get('album') or {}
     duration = int(float(item.get('interval') or 0))
     return {
-        'song_name': re.sub(r'<[^>]+>', '', str(item.get('title') or item.get('songname') or '未知歌曲')),
-        'singers': singers, 'album': album.get('title') or item.get('albumname'),
+        'song_name': clean_text(item.get('title') or item.get('songname') or '未知歌曲'),
+        'singers': singers, 'album': clean_text(album.get('title') or item.get('albumname')),
         'ext': '', 'codec': '', 'duration': time.strftime('%M:%S', time.gmtime(duration)),
         'file_size': f'{lossless_bytes / 1048576:.2f} MB' if lossless_bytes else '',
         'download_url': '', 'protocol': 'HTTP', 'identifier': str(item.get('mid') or item.get('songmid') or ''),
         'downloaded_contents': None, 'source': 'QQ音乐', 'downloadable': False,
         'catalog_lossless': bool(lossless_bytes),
         'requires_rights': bool((item.get('pay') or {}).get('pay_play')),
+        'catalog_item': item,
     }
 
 
 def qq_catalog_search(client, keyword, limit):
     """Read official QQ metadata so unresolved songs do not disappear from search."""
     rows = []
-    for search_meta in client._constructsearchurls(keyword, request_overrides={}):
-        search_meta = dict(search_meta)
-        url = search_meta.pop('url')
-        search_meta.pop('page_no', None)
-        response = client.post(url, **search_meta)
-        items = response.json()['music.search.SearchCgiService.DoSearchForQQMusicMobile']['data']['body']['item_song']
-        rows.extend(qq_catalog_row(item) for item in items)
-        if len(rows) >= limit:
-            break
+    original_source_limit, original_page_limit = client.search_size_per_source, client.search_size_per_page
+    client.search_size_per_source = limit
+    client.search_size_per_page = limit
+    try:
+        for search_meta in client._constructsearchurls(keyword, request_overrides={}):
+            search_meta = dict(search_meta)
+            url = search_meta.pop('url')
+            search_meta.pop('page_no', None)
+            response = client.post(url, **search_meta)
+            items = response.json()['music.search.SearchCgiService.DoSearchForQQMusicMobile']['data']['body']['item_song']
+            rows.extend(qq_catalog_row(item) for item in items)
+            if len(rows) >= limit:
+                break
+    finally:
+        client.search_size_per_source = original_source_limit
+        client.search_size_per_page = original_page_limit
     return rows[:limit]
 
 
@@ -74,7 +88,24 @@ class SearchLog:
     def error(self, *args, **kwargs): self.errors += 1
 
 
-def source_worker(repo, source, keyword, limit, channel):
+def song_row(song, client, source):
+    row = {key: getattr(song, key, None) for key in (
+        'song_name', 'singers', 'album', 'ext', 'codec', 'duration', 'file_size',
+        'download_url', 'protocol', 'identifier', 'downloaded_contents')}
+    if row['protocol'] != 'HTTP' or not isinstance(row['download_url'], str):
+        return None
+    row['headers'] = song.default_download_headers or client.default_download_headers
+    row['cookies'] = song.default_download_cookies or client.default_download_cookies
+    row['source'] = source
+    row['downloadable'] = True
+    if source == 'QQ音乐':
+        catalog = qq_catalog_row((song.raw_data or {}).get('search') or {})
+        row['catalog_lossless'] = catalog['catalog_lossless']
+        row['requires_rights'] = catalog['requires_rights']
+    return row
+
+
+def source_worker(repo, source, keyword, resolve_limit, catalog_limit, channel):
     try:
         sys.path.insert(0, repo)
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
@@ -82,8 +113,15 @@ def source_worker(repo, source, keyword, limit, channel):
             logger = SearchLog()
             with tempfile.TemporaryDirectory(prefix='shiyin-search-') as cache:
                 client = BuildMusicClient(module_cfg=dict(type=SOURCES[source], work_dir=cache,
-                    search_size_per_source=limit, search_size_per_page=limit,
+                    search_size_per_source=resolve_limit, search_size_per_page=resolve_limit,
                     max_retries=1, disable_print=True, logger_handle=logger))
+                catalog_rows = []
+                if source == 'QQ音乐':
+                    try:
+                        catalog_rows = qq_catalog_search(client, keyword, catalog_limit)
+                        channel.put(('partial', catalog_rows, f'{len(catalog_rows)} 首目录结果 · 正在解析前 {resolve_limit} 首'))
+                    except Exception:
+                        logger.errors += 1
                 # Many musicdl parsers set their own timeout. Passing another timeout
                 # here breaks them with "multiple values for keyword argument".
                 songs = client.search(keyword, num_threadings=3, request_overrides={})
@@ -91,50 +129,38 @@ def source_worker(repo, source, keyword, limit, channel):
                 for song in songs:
                     if not song.with_valid_download_url:
                         continue
-                    row = {key: getattr(song, key, None) for key in (
-                        'song_name', 'singers', 'album', 'ext', 'codec', 'duration', 'file_size',
-                        'download_url', 'protocol', 'identifier', 'downloaded_contents')}
-                    if row['protocol'] != 'HTTP' or not isinstance(row['download_url'], str):
-                        continue
-                    row['headers'] = song.default_download_headers or client.default_download_headers
-                    row['cookies'] = song.default_download_cookies or client.default_download_cookies
-                    row['source'] = source
-                    row['downloadable'] = True
-                    if source == 'QQ音乐':
-                        catalog = qq_catalog_row((song.raw_data or {}).get('search') or {})
-                        row['catalog_lossless'] = catalog['catalog_lossless']
-                        row['requires_rights'] = catalog['requires_rights']
-                    results.append(row)
+                    if row := song_row(song, client, source): results.append(row)
                 if source == 'QQ音乐':
-                    try:
-                        existing = {str(row.get('identifier') or '') for row in results}
-                        results.extend(row for row in qq_catalog_search(client, keyword, limit) if row['identifier'] not in existing)
-                    except Exception:
-                        logger.errors += 1
+                    resolved = {str(row.get('identifier') or ''): row for row in results}
+                    merged = [resolved.pop(row['identifier'], row) for row in catalog_rows]
+                    results = merged + list(resolved.values())
                 downloadable = sum(row.get('downloadable', True) for row in results)
                 actual_lossless = sum(lossless(row) and row.get('downloadable', True) for row in results)
                 catalog_only = len(results) - downloadable
                 status = f'{downloadable} 首可下载 · {actual_lossless} 首无损'
                 if catalog_only: status += f' · {catalog_only} 首仅目录'
                 if logger.errors: status += f' · {logger.errors} 次接口错误'
-                channel.put((results, status))
+                channel.put(('done', results, status))
     except Exception as exc:
-        channel.put(([], f'不可用：{type(exc).__name__}: {exc}'[:220]))
+        channel.put(('done', [], f'不可用：{type(exc).__name__}: {exc}'[:220]))
 
 
-def search(repo, sources, keyword, limit, cancel, emit, timeout=90):
+def search(repo, sources, keyword, resolve_limit, cancel, emit, timeout=90, catalog_limit=None):
     ctx = mp.get_context('spawn')
+    catalog_limit = catalog_limit or resolve_limit
     def run(source):
         channel = ctx.Queue()
-        process = ctx.Process(target=source_worker, args=(str(repo), source, keyword, limit, channel), daemon=True)
+        process = ctx.Process(target=source_worker, args=(str(repo), source, keyword, resolve_limit, catalog_limit, channel), daemon=True)
         process.start()
         deadline = time.monotonic() + timeout
         try:
             while not cancel.is_set() and time.monotonic() < deadline:
                 try:
-                    rows, status = channel.get(timeout=0.15)
-                    emit('source', (source, rows, status))
-                    return
+                    message, rows, status = channel.get(timeout=0.15)
+                    if message == 'partial': emit('source_partial', (source, rows, status))
+                    else:
+                        emit('source', (source, rows, status))
+                        return
                 except queue.Empty:
                     if not process.is_alive():
                         emit('source', (source, [], '搜索进程退出，检查依赖'))
@@ -144,9 +170,57 @@ def search(repo, sources, keyword, limit, cancel, emit, timeout=90):
             if process.is_alive(): process.terminate()
             process.join(3)
             channel.close()
+    ordered_sources = sorted(sources, key=lambda source: SOURCE_PRIORITY.get(source, 99))
     with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = [pool.submit(run, source) for source in sources]
+        futures = [pool.submit(run, source) for source in ordered_sources]
         for future in futures: future.result()
+
+
+def resolve_worker(repo, catalog_song, channel):
+    try:
+        sys.path.insert(0, repo)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            from musicdl.modules import BuildMusicClient, SongInfo
+            logger = SearchLog()
+            with tempfile.TemporaryDirectory(prefix='shiyin-resolve-') as cache:
+                client = BuildMusicClient(module_cfg=dict(type='QQMusicClient', work_dir=cache,
+                    search_size_per_source=1, search_size_per_page=1, max_retries=1,
+                    disable_print=True, logger_handle=logger))
+                item = catalog_song.get('catalog_item') or {}
+                if not item: raise ValueError('目录结果缺少解析信息，请重新搜索')
+                third_party = client._parsewiththirdpartapis(search_result=item, request_overrides={})
+                resolved = SongInfo(source=client.source)
+                with contextlib.suppress(Exception):
+                    resolved = client._parsewithofficialapiv1(search_result=item, song_info_flac=third_party,
+                        lossless_quality_is_sufficient=True, request_overrides={})
+                resolved = resolved if resolved.with_valid_download_url else third_party
+                if not resolved.with_valid_download_url: raise ValueError('QQ 当前未返回可下载直链，请改选其他音源')
+                row = song_row(resolved, client, 'QQ音乐')
+                if not row: raise ValueError('QQ 返回的音频协议暂不支持')
+                channel.put((row, ''))
+    except Exception as exc:
+        channel.put((None, f'{type(exc).__name__}: {exc}'))
+
+
+def resolve_catalog_song(repo, song, cancel, timeout=45):
+    ctx, deadline = mp.get_context('spawn'), time.monotonic() + timeout
+    channel = ctx.Queue()
+    process = ctx.Process(target=resolve_worker, args=(str(repo), song, channel), daemon=True)
+    process.start()
+    try:
+        while not cancel.is_set() and time.monotonic() < deadline:
+            try:
+                resolved, error = channel.get(timeout=0.15)
+                if error: raise ValueError(error)
+                return resolved
+            except queue.Empty:
+                if not process.is_alive(): raise ValueError('QQ 解析进程异常退出')
+        if cancel.is_set(): raise Cancelled()
+        raise TimeoutError('QQ 按需解析超过 45 秒')
+    finally:
+        if process.is_alive(): process.terminate()
+        process.join(3)
+        channel.close()
 
 
 class Cancelled(Exception): pass
