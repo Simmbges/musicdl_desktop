@@ -1,10 +1,13 @@
 """拾音 · musicdl 桌面版。"""
 import ctypes
+from datetime import datetime
 import json
 import multiprocessing
 import os
+import platform
 from pathlib import Path
 import queue
+import sys
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -20,6 +23,7 @@ class App:
         self.busy = False
         self.rows = []
         self.tasks = {}
+        self.download_meta = {}
         self.source_status = {}
         self.settings_path = ROOT / 'settings.json'
         try: settings = json.loads(self.settings_path.read_text('utf-8'))
@@ -97,7 +101,10 @@ class App:
         ttk.Entry(savebar, textvariable=self.directory).pack(side='left', fill='x', expand=True, ipady=5)
         ttk.Button(savebar, text='更改目录', command=self.choose_directory).pack(side='left', padx=8)
         ttk.Button(savebar, text='打开文件夹', command=self.open_directory).pack(side='left')
-        ttk.Label(body, text='下载记录', font=('Microsoft YaHei UI', 11, 'bold')).pack(anchor='w', pady=(0, 6))
+        queue_header = ttk.Frame(body)
+        queue_header.pack(fill='x', pady=(0, 6))
+        ttk.Label(queue_header, text='下载记录', font=('Microsoft YaHei UI', 11, 'bold')).pack(side='left')
+        ttk.Button(queue_header, text='一键复制失败信息', command=self.copy_failures).pack(side='right')
         self.queue_table = self.make_table(body, ['歌曲', '状态', '进度 / 位置'], [300, 140, 600], height=4, expand=False)
         self.progress = ttk.Progressbar(body, mode='determinate')
         self.progress.pack(fill='x', pady=(10, 6))
@@ -145,6 +152,44 @@ class App:
             path.mkdir(parents=True, exist_ok=True)
             os.startfile(path)
         except OSError as exc: messagebox.showerror('无法打开目录', str(exc))
+
+    def failure_report(self):
+        failures = []
+        for key in self.queue_table.get_children():
+            if self.queue_table.set(key, 1) != '失败':
+                continue
+            song = self.download_meta.get(key, {})
+            failures.append('\n'.join((
+                f"歌曲：{song.get('song_name') or self.queue_table.set(key, 0) or '未知'}",
+                f"歌手：{song.get('singers') or '未知'}",
+                f"来源：{song.get('source') or '未知'}",
+                f"格式：{str(song.get('ext') or '未知').upper()}",
+                f"错误：{self.queue_table.set(key, 2) or '未提供详情'}",
+            )))
+        if not failures:
+            return ''
+        header = '\n'.join((
+            '拾音下载失败报告',
+            f'生成时间：{datetime.now().astimezone().isoformat(timespec="seconds")}',
+            f'系统：{platform.platform()}',
+            f'Python：{sys.version.split()[0]}',
+            f'musicdl 项目：{self.repo}',
+            f'失败数量：{len(failures)}',
+        ))
+        return header + '\n\n' + '\n\n---\n\n'.join(failures)
+
+    def copy_failures(self):
+        report = self.failure_report()
+        if not report:
+            messagebox.showinfo('复制失败信息', '当前下载记录中没有失败项目。')
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(report)
+            self.root.update_idletasks()
+            self.status.set(f'已复制 {report.count("歌曲：")} 条下载失败信息，可以直接粘贴发给我。')
+        except tk.TclError as exc:
+            messagebox.showerror('复制失败', str(exc))
 
     def set_busy(self, value):
         self.busy = value
@@ -209,6 +254,7 @@ class App:
         tasks = []
         for song in songs:
             key = self.queue_table.insert('', 'end', values=(song['song_name'], '等待下载', ''))
+            self.download_meta[key] = song
             tasks.append((key, song))
         self.progress.stop()
         self.progress.configure(mode='determinate', value=0)

@@ -81,6 +81,15 @@ class Checks(unittest.TestCase):
         app.only_lossless.set(True)
         app.render()
         self.assertEqual(len(app.table.get_children()), 1)
+        failed = app.queue_table.insert('', 'end', values=('失败歌曲', '失败', 'HTTP Error 403'))
+        app.download_meta[failed] = dict(song_name='失败歌曲', singers='歌手', source='酷我', ext='flac')
+        report = app.failure_report()
+        self.assertIn('失败数量：1', report)
+        self.assertIn('错误：HTTP Error 403', report)
+        self.assertNotIn('download_url', report)
+        app.copy_failures()
+        root.update()
+        self.assertEqual(root.clipboard_get(), report)
         root.destroy()
 
 
