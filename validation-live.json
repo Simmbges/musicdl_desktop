@@ -1,0 +1,39 @@
+[
+  {
+    "source": "酷我",
+    "status": "3 首",
+    "count": 3,
+    "lossless": 3
+  },
+  {
+    "source": "酷狗",
+    "status": "3 首",
+    "count": 3,
+    "lossless": 3
+  },
+  {
+    "source": "ccMixter",
+    "status": "0 首",
+    "count": 0,
+    "lossless": 0
+  },
+  {
+    "source": "网易云",
+    "status": "3 首",
+    "count": 3,
+    "lossless": 3
+  },
+  {
+    "source": "QQ音乐",
+    "status": "3 首",
+    "count": 3,
+    "lossless": 0
+  },
+  {
+    "download": "成功",
+    "source": "酷我",
+    "format": "flac",
+    "size": 9543754,
+    "file": "C:\\Users\\Simmb\\Documents\\code\\codex_1\\musicdl_desktop\\verification-downloads\\Piano - 林国凯&陈玠含 [酷我].flac"
+  }
+]
