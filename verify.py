@@ -172,7 +172,7 @@ class Checks(unittest.TestCase):
         app.poll()
         self.assertEqual(len(app.table.get_children()), 2)
         self.assertEqual(str(app.download_button['state']), 'normal')
-        self.assertIn('点击后解析', app.table.set(str(app.rows.index(catalog)), 3))
+        self.assertEqual('无损 · FLAC', app.table.set(str(app.rows.index(catalog)), 3))
         app.table.selection_set(str(app.rows.index(catalog)))
         with patch.object(app, 'save_settings'):
             app.begin_download()

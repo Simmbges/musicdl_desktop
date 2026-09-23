@@ -50,7 +50,7 @@ def names(items):
 
 def catalog_row(source, item):
     """Convert one source search item to visible metadata without a download URL."""
-    title = singers = album = identifier = ''
+    title = singers = album = identifier = catalog_format = ''
     duration = lossless_bytes = 0
     catalog_lossless = requires_rights = False
     if source == '网易云':
@@ -61,6 +61,7 @@ def catalog_row(source, item):
         qualities = [item.get('hr') or {}, item.get('sq') or {}]
         lossless_bytes = max((numeric_size(meta.get('size')) for meta in qualities if isinstance(meta, dict)), default=0)
         catalog_lossless = bool(lossless_bytes or item.get('hr') or item.get('sq'))
+        if any(item.get(key) for key in ('h', 'm', 'l', 'hMusic', 'mMusic', 'lMusic')): catalog_format = 'MP3'
     elif source == 'QQ音乐':
         file_info, album_info = item.get('file') or {}, item.get('album') or {}
         title = item.get('title') or item.get('songname')
@@ -70,6 +71,7 @@ def catalog_row(source, item):
         lossless_bytes = max((numeric_size(file_info.get(key)) for key in ('size_flac', 'size_hires', 'size_new')), default=0)
         catalog_lossless = bool(lossless_bytes)
         requires_rights = bool((item.get('pay') or {}).get('pay_play'))
+        if any(numeric_size(file_info.get(key)) for key in ('size_320mp3', 'size_128mp3')): catalog_format = 'MP3'
     elif source == '酷狗':
         title = item.get('songname') or item.get('SongName') or item.get('songname_original') or item.get('OriSongName') or item.get('filename') or item.get('FileName') or item.get('name')
         singers = item.get('singername') or item.get('SingerName') or names(item.get('singerinfo') or item.get('Singers'))
@@ -78,12 +80,14 @@ def catalog_row(source, item):
         duration = item.get('duration') or item.get('Duration') or (float(item.get('timelen') or 0) / 1000)
         lossless_bytes = max(numeric_size(item.get(key)) for key in ('SQFileSize', 'sqfilesize', 'ResFileSize', 'resfilesize'))
         catalog_lossless = bool(lossless_bytes or item.get('SQFileHash') or item.get('sqhash'))
+        if item.get('FileHash') or item.get('hash'): catalog_format = 'MP3'
     elif source == '酷我':
         title = item.get('SONGNAME') or item.get('name') or item.get('songName')
         singers, album = item.get('ARTIST') or item.get('artist'), item.get('ALBUM') or item.get('album')
         identifier, duration = item.get('MUSICRID') or item.get('musicrid'), item.get('DURATION') or item.get('duration') or 0
         formats = str(item.get('FORMATS') or item.get('formats') or '').lower()
         catalog_lossless = 'flac' in formats
+        catalog_format = next((ext.upper() for ext in ('flac', 'ape', 'mp3', 'aac', 'wma') if ext in formats), '')
     elif source == '咪咕':
         title = item.get('name') or item.get('songName')
         singers = names(item.get('singers') or item.get('singerList'))
@@ -94,6 +98,7 @@ def catalog_row(source, item):
         lossless_formats = [meta for meta in formats if isinstance(meta, dict) and str(meta.get('formatType') or '').upper() in {'SQ', 'ZQ', 'FLAC'}]
         lossless_bytes = max((numeric_size(meta.get('size') or meta.get('iosSize') or meta.get('androidSize')) for meta in lossless_formats), default=0)
         catalog_lossless = bool(lossless_formats)
+        if any(isinstance(meta, dict) and str(meta.get('formatType') or '').upper() in {'PQ', 'HQ', 'MP3'} for meta in formats): catalog_format = 'MP3'
     elif source == '千千':
         title, singers, album = item.get('title'), names(item.get('artist')), item.get('albumTitle')
         identifier, duration = item.get('TSID'), item.get('duration') or 0
@@ -104,6 +109,10 @@ def catalog_row(source, item):
     elif source == 'ccMixter':
         title, singers, album = item.get('title'), item.get('creator'), item.get('album')
         identifier, duration = item.get('identifier'), item.get('duration') or 0
+        ext = Path(urllib.parse.urlsplit(item.get('download_url') or '').path).suffix.lstrip('.').lower()
+        if ext in LOSSLESS | {'mp3', 'aac', 'ogg', 'm4a', 'opus', 'wma'}: catalog_format = ext.upper()
+    if catalog_lossless and source in {'网易云', 'QQ音乐', '酷狗', '酷我', '咪咕'}:
+        catalog_format = 'FLAC'
     try: duration = int(float(duration or 0))
     except (TypeError, ValueError): duration = 0
     return {
@@ -113,6 +122,7 @@ def catalog_row(source, item):
         'download_url': '', 'protocol': 'HTTP', 'identifier': str(identifier or ''),
         'downloaded_contents': None, 'source': source, 'downloadable': False,
         'catalog_lossless': catalog_lossless, 'requires_rights': requires_rights,
+        'catalog_format': catalog_format,
         'catalog_item': item,
     }
 

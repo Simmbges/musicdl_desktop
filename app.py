@@ -293,7 +293,7 @@ class App:
             if self.only_lossless.get() and not is_lossless(s): continue
             downloadable = s.get('downloadable', True)
             if not downloadable:
-                quality = '目录有无损 · 点击后解析' if s.get('catalog_lossless') else '点击下载时解析'
+                quality = ('无损 · ' if s.get('catalog_lossless') else '') + (s.get('catalog_format') or '未知')
             else:
                 quality = ('无损 · ' if lossless(s) else '') + str(s.get('ext') or '未知').upper()
                 if s.get('catalog_lossless') and not lossless(s): quality += ' · 目录有 FLAC'
