@@ -45,6 +45,7 @@ class App:
         self.mode_help = tk.StringVar()
         self.status = tk.StringVar(value='输入歌名或歌手，开始寻找你的下一首收藏。')
         self.count = tk.StringVar(value='尚未搜索')
+        self.queue_summary = tk.StringVar(value='暂无下载任务')
         root.title('拾音 · 无损音乐桌面版')
         scale = max(1, float(root.tk.call('tk', 'scaling')) / (96 / 72))
         px = lambda value: round(value * scale)
@@ -99,8 +100,11 @@ class App:
         self.limit.pack(side='left')
         ttk.Label(filters, text='首').pack(side='left', padx=(6, 14))
         ttk.Label(filters, textvariable=self.mode_help, foreground='#60747c').pack(side='left')
-        ttk.Label(filters, textvariable=self.count).pack(side='right')
-        self.table = self.make_table(body, ['歌曲', '歌手', '专辑', '音质 / 格式', '时长', '大小', '来源'], [250, 160, 180, 120, 75, 85, 90], height=8)
+        results_header = ttk.Frame(body)
+        results_header.pack(fill='x', pady=(5, 6))
+        ttk.Label(results_header, text='搜索结果', font=('Microsoft YaHei UI', 11, 'bold')).pack(side='left')
+        ttk.Label(results_header, textvariable=self.count).pack(side='right')
+        self.table = self.make_table(body, ['歌曲', '歌手', '专辑', '音质 / 格式', '时长', '大小', '来源'], [250, 160, 180, 120, 75, 85, 90], height=12)
         self.table.tag_configure('lossless', foreground='#087566')
         self.table.tag_configure('unavailable', foreground='#8a7770')
         self.table.bind('<Double-1>', lambda _: self.begin_download())
@@ -119,9 +123,12 @@ class App:
         ttk.Button(savebar, text='打开文件夹', command=self.open_directory).pack(side='left')
         queue_header = ttk.Frame(body)
         queue_header.pack(fill='x', pady=(0, 6))
-        ttk.Label(queue_header, text='下载记录', font=('Microsoft YaHei UI', 11, 'bold')).pack(side='left')
+        self.queue_button = ttk.Button(queue_header, text='▸ 下载队列', command=self.toggle_queue)
+        self.queue_button.pack(side='left')
+        ttk.Label(queue_header, textvariable=self.queue_summary, foreground='#60747c').pack(side='left', padx=10)
         ttk.Button(queue_header, text='一键复制失败信息', command=self.copy_failures).pack(side='right')
-        self.queue_table = self.make_table(body, ['歌曲', '状态', '进度 / 位置'], [300, 140, 600], height=4, expand=False)
+        self.queue_panel = ttk.Frame(body)
+        self.queue_table = self.make_table(self.queue_panel, ['歌曲', '状态', '进度 / 位置'], [300, 140, 600], height=5, expand=False)
         self.progress = ttk.Progressbar(body, mode='determinate')
         self.progress.pack(fill='x', pady=(10, 6))
         ttk.Label(body, textvariable=self.status, wraplength=1090).pack(fill='x')
@@ -144,6 +151,20 @@ class App:
         scrollbar.pack(side='right', fill='y')
         table.pack(fill='both', expand=True)
         return table
+
+    def toggle_queue(self, expanded=None):
+        if expanded is None: expanded = not self.queue_panel.winfo_manager()
+        if expanded:
+            self.queue_panel.pack(fill='x', before=self.progress)
+        else:
+            self.queue_panel.pack_forget()
+        self.queue_button.configure(text=('▾' if expanded else '▸') + ' 下载队列')
+
+    def update_queue_summary(self):
+        keys = self.queue_table.get_children()
+        completed = sum(self.queue_table.set(key, 1) == '已完成' for key in keys)
+        failed = sum(self.queue_table.set(key, 1) == '失败' for key in keys)
+        self.queue_summary.set(f'{len(keys)} 首 · 已完成 {completed} · 失败 {failed}' if keys else '暂无下载任务')
 
     def save_settings(self):
         data = dict(repo=self.repo, directory=self.directory.get(),
@@ -335,6 +356,8 @@ class App:
             key = self.queue_table.insert('', 'end', values=(song['song_name'], '等待下载', ''))
             self.download_meta[key] = song
             tasks.append((key, song))
+        self.update_queue_summary()
+        self.toggle_queue(True)
         self.progress.stop()
         self.progress.configure(mode='determinate', value=0)
         self.status.set(f'正在下载 {len(tasks)} 首歌曲；取消会停止当前文件及后续队列。')
@@ -399,6 +422,7 @@ class App:
                 self.queue_table.set(key, 1, state)
                 self.queue_table.set(key, 2, detail)
                 self.queue_table.see(key)
+                self.update_queue_summary()
             elif kind == 'progress':
                 key, done, total = data
                 detail = f'{done / 1048576:.1f} MB' + (f' / {total / 1048576:.1f} MB' if total else '')
