@@ -268,7 +268,9 @@ class App:
                 try:
                     def progress(done, total): self.events.put(('progress', (key, done, total)))
                     path = download(song, directory, self.cancel, progress)
-                    self.events.put(('task', (key, '已完成', str(path))))
+                    note = song.pop('_download_note', '')
+                    detail = str(path) + (f' · {note}' if note else '')
+                    self.events.put(('task', (key, '已完成', detail)))
                 except Cancelled:
                     self.events.put(('task', (key, '已取消', '临时文件已清理')))
                 except Exception as exc:

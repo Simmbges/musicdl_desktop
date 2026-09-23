@@ -5,7 +5,9 @@ from pathlib import Path
 import tempfile
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+import ssl
+import urllib.error
 import wave
 import tkinter as tk
 from backend import download, Cancelled, lossless, search, DEFAULT_REPO
@@ -62,6 +64,33 @@ class Checks(unittest.TestCase):
                 with self.assertRaises(ValueError): download(song, folder, threading.Event(), lambda *_: None)
             self.assertEqual(len(list(Path(folder).iterdir())), 1)
 
+    def test_kugou_certificate_fallback_is_scoped(self):
+        class Response(io.BytesIO):
+            def __init__(self, payload):
+                super().__init__(payload)
+                self.headers = {'Content-Length': str(len(payload))}
+            def __enter__(self): return self
+            def __exit__(self, *args): self.close()
+        song = self.song()
+        song.update(source='酷狗', download_url='https://fs.youthandroid2.kugou.com/test.wav')
+        song.pop('downloaded_contents')
+        certificate_error = urllib.error.URLError(ssl.SSLCertVerificationError('CERTIFICATE_VERIFY_FAILED'))
+        opener = Mock()
+        opener.open.return_value = Response(wav_bytes())
+        with tempfile.TemporaryDirectory() as folder:
+            with patch('urllib.request.urlopen', side_effect=certificate_error), patch('urllib.request.build_opener', return_value=opener):
+                result = download(song, folder, threading.Event(), lambda *_: None)
+            self.assertTrue(result.is_file())
+            self.assertIn('酷狗证书兼容模式', song['_download_note'])
+            opener.open.assert_called_once()
+        other = dict(song, source='网易云')
+        other.pop('_download_note', None)
+        with tempfile.TemporaryDirectory() as folder:
+            with patch('urllib.request.urlopen', side_effect=certificate_error), patch('urllib.request.build_opener') as build:
+                with self.assertRaises(urllib.error.URLError):
+                    download(other, folder, threading.Event(), lambda *_: None)
+                build.assert_not_called()
+
     def test_quality(self):
         self.assertTrue(lossless({'ext': 'FLAC'}))
         self.assertFalse(lossless({'ext': 'm4a'}))
@@ -95,7 +124,19 @@ class Checks(unittest.TestCase):
 
 if __name__ == '__main__':
     import sys
-    if '--live' in sys.argv:
+    if '--kugou-live' in sys.argv:
+        candidates = []
+        def emit_kugou(kind, data):
+            source, songs, status = data
+            candidates.extend(songs)
+            print(source, status, flush=True)
+        search(DEFAULT_REPO, ['酷狗'], '晴天 周杰伦', 3, threading.Event(), emit_kugou, timeout=75)
+        target = next((song for song in candidates if song.get('song_name') == '晴天' and lossless(song)), None)
+        if not target:
+            raise RuntimeError('未找到酷狗无损测试结果')
+        path = download(target, Path('verification-downloads'), threading.Event(), lambda *_: None)
+        print('下载成功', path.name, path.stat().st_size, target.get('_download_note', ''), flush=True)
+    elif '--live' in sys.argv:
         report = []
         candidates = []
         def emit(kind, data):

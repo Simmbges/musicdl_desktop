@@ -6,10 +6,13 @@ import os
 from pathlib import Path
 import queue
 import re
+import ssl
 import sys
 import tempfile
 import time
 import urllib.request
+import urllib.error
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 
 ROOT = Path(__file__).resolve().parent
@@ -93,6 +96,31 @@ def search(repo, sources, keyword, limit, cancel, emit, timeout=90):
 class Cancelled(Exception): pass
 
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def open_audio(song, request, timeout=20):
+    """Open strictly, with one tightly scoped fallback for a broken Kugou CDN cert."""
+    try:
+        return urllib.request.urlopen(request, timeout=timeout)
+    except urllib.error.URLError as exc:
+        hostname = (urllib.parse.urlsplit(request.full_url).hostname or '').lower()
+        certificate_error = isinstance(exc.reason, ssl.SSLCertVerificationError) or 'CERTIFICATE_VERIFY_FAILED' in str(exc)
+        if song.get('source') != '酷狗' or hostname != 'fs.youthandroid2.kugou.com' or not certificate_error:
+            raise
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        # Do not follow redirects while verification is disabled: headers and cookies
+        # must only reach the exact host that triggered the known compatibility case.
+        opener = urllib.request.build_opener(NoRedirect(), urllib.request.HTTPSHandler(context=context))
+        response = opener.open(request, timeout=timeout)
+        song['_download_note'] = '已使用酷狗证书兼容模式（仅限已知 CDN，禁止跨域跳转）'
+        return response
+
+
 def filename(song):
     name = f"{song.get('song_name') or '未命名'} - {song.get('singers') or '未知歌手'} [{song['source']}]"
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name).strip(' .')[:140]
@@ -120,7 +148,7 @@ def download(song, directory, cancel, progress):
                 cookies = song.get('cookies') or {}
                 if cookies: headers['Cookie'] = '; '.join(f'{k}={v}' for k, v in cookies.items())
                 headers['Accept-Encoding'] = 'identity'
-                with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=20) as response:
+                with open_audio(song, urllib.request.Request(url, headers=headers), timeout=20) as response:
                     total = int(response.headers.get('Content-Length') or 0)
                     size = 0
                     while True:
