@@ -31,52 +31,94 @@ def lossless(song):
     return str(song.get('ext') or '').lower().lstrip('.') in LOSSLESS or str(song.get('codec') or '').lower() == 'alac'
 
 
-def qq_catalog_row(item):
-    """Convert a QQ search item to a visible, non-downloadable catalog row."""
-    def clean_text(value):
-        return html.unescape(re.sub(r'<[^>]+>', '', str(value or ''))).strip()
+def clean_text(value):
+    return html.unescape(re.sub(r'<[^>]+>', '', str(value or ''))).strip()
 
-    file_info = item.get('file') or {}
-    def numeric_size(value):
-        try: return int(value or 0)
-        except (TypeError, ValueError): return 0
-    lossless_bytes = max((numeric_size(file_info.get(key)) for key in ('size_flac', 'size_hires', 'size_new')), default=0)
-    singers = ', '.join(clean_text(singer.get('name')) for singer in (item.get('singer') or []) if singer.get('name'))
-    album = item.get('album') or {}
-    duration = int(float(item.get('interval') or 0))
+
+def numeric_size(value):
+    try:
+        text = str(value or 0).strip()
+        if text.upper().endswith('MB'): return int(float(text[:-2].strip()) * 1048576)
+        return int(float(text))
+    except (TypeError, ValueError):
+        return 0
+
+
+def names(items):
+    return ', '.join(clean_text(item.get('name')) for item in (items or []) if isinstance(item, dict) and item.get('name'))
+
+
+def catalog_row(source, item):
+    """Convert one source search item to visible metadata without a download URL."""
+    title = singers = album = identifier = ''
+    duration = lossless_bytes = 0
+    catalog_lossless = requires_rights = False
+    if source == '网易云':
+        title, singers = item.get('name'), names(item.get('ar') or item.get('artists'))
+        album_info = item.get('al') or item.get('album') or {}
+        album = album_info.get('name') if isinstance(album_info, dict) else album_info
+        identifier, duration = item.get('id'), float(item.get('dt') or item.get('duration') or 0) / 1000
+        qualities = [item.get('hr') or {}, item.get('sq') or {}]
+        lossless_bytes = max((numeric_size(meta.get('size')) for meta in qualities if isinstance(meta, dict)), default=0)
+        catalog_lossless = bool(lossless_bytes or item.get('hr') or item.get('sq'))
+    elif source == 'QQ音乐':
+        file_info, album_info = item.get('file') or {}, item.get('album') or {}
+        title = item.get('title') or item.get('songname')
+        singers, album = names(item.get('singer')), album_info.get('title') if isinstance(album_info, dict) else item.get('albumname')
+        album = album or item.get('albumname')
+        identifier, duration = item.get('mid') or item.get('songmid'), item.get('interval') or 0
+        lossless_bytes = max((numeric_size(file_info.get(key)) for key in ('size_flac', 'size_hires', 'size_new')), default=0)
+        catalog_lossless = bool(lossless_bytes)
+        requires_rights = bool((item.get('pay') or {}).get('pay_play'))
+    elif source == '酷狗':
+        title = item.get('songname') or item.get('SongName') or item.get('songname_original') or item.get('OriSongName') or item.get('filename') or item.get('FileName') or item.get('name')
+        singers = item.get('singername') or item.get('SingerName') or names(item.get('singerinfo') or item.get('Singers'))
+        album = item.get('album_name') or item.get('AlbumName') or ((item.get('albuminfo') or {}).get('name'))
+        identifier = item.get('hash') or item.get('FileHash')
+        duration = item.get('duration') or item.get('Duration') or (float(item.get('timelen') or 0) / 1000)
+        lossless_bytes = max(numeric_size(item.get(key)) for key in ('SQFileSize', 'sqfilesize', 'ResFileSize', 'resfilesize'))
+        catalog_lossless = bool(lossless_bytes or item.get('SQFileHash') or item.get('sqhash'))
+    elif source == '酷我':
+        title = item.get('SONGNAME') or item.get('name') or item.get('songName')
+        singers, album = item.get('ARTIST') or item.get('artist'), item.get('ALBUM') or item.get('album')
+        identifier, duration = item.get('MUSICRID') or item.get('musicrid'), item.get('DURATION') or item.get('duration') or 0
+        formats = str(item.get('FORMATS') or item.get('formats') or '').lower()
+        catalog_lossless = 'flac' in formats
+    elif source == '咪咕':
+        title = item.get('name') or item.get('songName')
+        singers = names(item.get('singers') or item.get('singerList'))
+        album = item.get('album') or names(item.get('albums'))
+        identifier = item.get('contentId')
+        duration = item.get('duration') or item.get('length') or 0
+        formats = (item.get('rateFormats') or []) + (item.get('newRateFormats') or []) + (item.get('audioFormats') or [])
+        lossless_formats = [meta for meta in formats if isinstance(meta, dict) and str(meta.get('formatType') or '').upper() in {'SQ', 'ZQ', 'FLAC'}]
+        lossless_bytes = max((numeric_size(meta.get('size') or meta.get('iosSize') or meta.get('androidSize')) for meta in lossless_formats), default=0)
+        catalog_lossless = bool(lossless_formats)
+    elif source == '千千':
+        title, singers, album = item.get('title'), names(item.get('artist')), item.get('albumTitle')
+        identifier, duration = item.get('TSID'), item.get('duration') or 0
+        catalog_lossless = bool(item.get('hasLossless') or item.get('isLossless'))
+    elif source == '街声':
+        title, singers = item.get('title'), item.get('artist')
+        identifier = item.get('song_id')
+    elif source == 'ccMixter':
+        title, singers, album = item.get('title'), item.get('creator'), item.get('album')
+        identifier, duration = item.get('identifier'), item.get('duration') or 0
+    try: duration = int(float(duration or 0))
+    except (TypeError, ValueError): duration = 0
     return {
-        'song_name': clean_text(item.get('title') or item.get('songname') or '未知歌曲'),
-        'singers': singers, 'album': clean_text(album.get('title') or item.get('albumname')),
+        'song_name': clean_text(title) or '未知歌曲', 'singers': clean_text(singers), 'album': clean_text(album),
         'ext': '', 'codec': '', 'duration': time.strftime('%M:%S', time.gmtime(duration)),
         'file_size': f'{lossless_bytes / 1048576:.2f} MB' if lossless_bytes else '',
-        'download_url': '', 'protocol': 'HTTP', 'identifier': str(item.get('mid') or item.get('songmid') or ''),
-        'downloaded_contents': None, 'source': 'QQ音乐', 'downloadable': False,
-        'catalog_lossless': bool(lossless_bytes),
-        'requires_rights': bool((item.get('pay') or {}).get('pay_play')),
+        'download_url': '', 'protocol': 'HTTP', 'identifier': str(identifier or ''),
+        'downloaded_contents': None, 'source': source, 'downloadable': False,
+        'catalog_lossless': catalog_lossless, 'requires_rights': requires_rights,
         'catalog_item': item,
     }
 
 
-def qq_catalog_search(client, keyword, limit):
-    """Read official QQ metadata so unresolved songs do not disappear from search."""
-    rows = []
-    original_source_limit, original_page_limit = client.search_size_per_source, client.search_size_per_page
-    client.search_size_per_source = limit
-    client.search_size_per_page = limit
-    try:
-        for search_meta in client._constructsearchurls(keyword, request_overrides={}):
-            search_meta = dict(search_meta)
-            url = search_meta.pop('url')
-            search_meta.pop('page_no', None)
-            response = client.post(url, **search_meta)
-            items = response.json()['music.search.SearchCgiService.DoSearchForQQMusicMobile']['data']['body']['item_song']
-            rows.extend(qq_catalog_row(item) for item in items)
-            if len(rows) >= limit:
-                break
-    finally:
-        client.search_size_per_source = original_source_limit
-        client.search_size_per_page = original_page_limit
-    return rows[:limit]
+def qq_catalog_row(item):
+    return catalog_row('QQ音乐', item)
 
 
 class SearchLog:
@@ -98,10 +140,9 @@ def song_row(song, client, source):
     row['cookies'] = song.default_download_cookies or client.default_download_cookies
     row['source'] = source
     row['downloadable'] = True
-    if source == 'QQ音乐':
-        catalog = qq_catalog_row((song.raw_data or {}).get('search') or {})
-        row['catalog_lossless'] = catalog['catalog_lossless']
-        row['requires_rights'] = catalog['requires_rights']
+    catalog = catalog_row(source, (song.raw_data or {}).get('search') or {})
+    row['catalog_lossless'] = catalog['catalog_lossless']
+    row['requires_rights'] = catalog['requires_rights']
     return row
 
 
@@ -109,36 +150,26 @@ def source_worker(repo, source, keyword, resolve_limit, catalog_limit, channel):
     try:
         sys.path.insert(0, repo)
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            from musicdl.modules import BuildMusicClient
+            from musicdl.modules import BuildMusicClient, SongInfo
             logger = SearchLog()
             with tempfile.TemporaryDirectory(prefix='shiyin-search-') as cache:
                 client = BuildMusicClient(module_cfg=dict(type=SOURCES[source], work_dir=cache,
-                    search_size_per_source=resolve_limit, search_size_per_page=resolve_limit,
+                    search_size_per_source=catalog_limit, search_size_per_page=catalog_limit,
                     max_retries=1, disable_print=True, logger_handle=logger))
-                catalog_rows = []
-                if source == 'QQ音乐':
-                    try:
-                        catalog_rows = qq_catalog_search(client, keyword, catalog_limit)
-                        channel.put(('partial', catalog_rows, f'{len(catalog_rows)} 首目录结果 · 正在解析前 {resolve_limit} 首'))
-                    except Exception:
-                        logger.errors += 1
-                # Many musicdl parsers set their own timeout. Passing another timeout
-                # here breaks them with "multiple values for keyword argument".
+                def metadata_only_parser(search_result, *args, **kwargs):
+                    row = catalog_row(source, search_result)
+                    identifier = row['identifier'] or f"{row['song_name']}|{row['singers']}"
+                    return SongInfo(source=client.source, raw_data={'search': search_result, 'download': {}, 'lyric': {}},
+                        song_name=row['song_name'], singers=row['singers'], album=row['album'], ext='mp3',
+                        file_size_bytes=0, file_size='', duration_s=0, duration=row['duration'],
+                        identifier=identifier, download_url=f"https://catalog.invalid/{urllib.parse.quote(identifier)}",
+                        download_url_status={'ok': True})
+                client._parsewithofficialapiv1 = metadata_only_parser
+                if hasattr(client, '_parsewiththirdpartapis'):
+                    client._parsewiththirdpartapis = metadata_only_parser
                 songs = client.search(keyword, num_threadings=3, request_overrides={})
-                results = []
-                for song in songs:
-                    if not song.with_valid_download_url:
-                        continue
-                    if row := song_row(song, client, source): results.append(row)
-                if source == 'QQ音乐':
-                    resolved = {str(row.get('identifier') or ''): row for row in results}
-                    merged = [resolved.pop(row['identifier'], row) for row in catalog_rows]
-                    results = merged + list(resolved.values())
-                downloadable = sum(row.get('downloadable', True) for row in results)
-                actual_lossless = sum(lossless(row) and row.get('downloadable', True) for row in results)
-                catalog_only = len(results) - downloadable
-                status = f'{downloadable} 首可下载 · {actual_lossless} 首无损'
-                if catalog_only: status += f' · {catalog_only} 首仅目录'
+                results = [catalog_row(source, (song.raw_data or {}).get('search') or {}) for song in songs]
+                status = f'{len(results)} 首目录结果 · 等待按需解析'
                 if logger.errors: status += f' · {logger.errors} 次接口错误'
                 channel.put(('done', results, status))
     except Exception as exc:
@@ -183,20 +214,32 @@ def resolve_worker(repo, catalog_song, channel):
             from musicdl.modules import BuildMusicClient, SongInfo
             logger = SearchLog()
             with tempfile.TemporaryDirectory(prefix='shiyin-resolve-') as cache:
-                client = BuildMusicClient(module_cfg=dict(type='QQMusicClient', work_dir=cache,
+                source = catalog_song.get('source') or ''
+                if source not in SOURCES: raise ValueError('目录结果缺少有效音源，请重新搜索')
+                client = BuildMusicClient(module_cfg=dict(type=SOURCES[source], work_dir=cache,
                     search_size_per_source=1, search_size_per_page=1, max_retries=1,
                     disable_print=True, logger_handle=logger))
                 item = catalog_song.get('catalog_item') or {}
                 if not item: raise ValueError('目录结果缺少解析信息，请重新搜索')
-                third_party = client._parsewiththirdpartapis(search_result=item, request_overrides={})
+                third_party = SongInfo(source=client.source)
+                if hasattr(client, '_parsewiththirdpartapis'):
+                    with contextlib.suppress(Exception):
+                        third_party = client._parsewiththirdpartapis(search_result=item, request_overrides={})
                 resolved = SongInfo(source=client.source)
                 with contextlib.suppress(Exception):
                     resolved = client._parsewithofficialapiv1(search_result=item, song_info_flac=third_party,
                         lossless_quality_is_sufficient=True, request_overrides={})
                 resolved = resolved if resolved.with_valid_download_url else third_party
-                if not resolved.with_valid_download_url: raise ValueError('QQ 当前未返回可下载直链，请改选其他音源')
-                row = song_row(resolved, client, 'QQ音乐')
-                if not row: raise ValueError('QQ 返回的音频协议暂不支持')
+                if not resolved.with_valid_download_url: raise ValueError(f'{source}当前未返回可下载地址，请改选其他音源')
+                if str(resolved.protocol or '').upper() == 'HLS':
+                    resolved.work_dir = cache
+                    downloaded = client.download([resolved], num_threadings=1, request_overrides={}, auto_supplement_song=False)
+                    if not downloaded or not Path(downloaded[0].save_path).is_file():
+                        raise ValueError(f'{source}分段音频下载失败')
+                    resolved.downloaded_contents = Path(downloaded[0].save_path).read_bytes()
+                    resolved.protocol = 'HTTP'
+                row = song_row(resolved, client, source)
+                if not row: raise ValueError(f'{source}返回的音频协议暂不支持')
                 channel.put((row, ''))
     except Exception as exc:
         channel.put((None, f'{type(exc).__name__}: {exc}'))
@@ -214,9 +257,9 @@ def resolve_catalog_song(repo, song, cancel, timeout=45):
                 if error: raise ValueError(error)
                 return resolved
             except queue.Empty:
-                if not process.is_alive(): raise ValueError('QQ 解析进程异常退出')
+                if not process.is_alive(): raise ValueError(f"{song.get('source') or '音源'}解析进程异常退出")
         if cancel.is_set(): raise Cancelled()
-        raise TimeoutError('QQ 按需解析超过 45 秒')
+        raise TimeoutError(f"{song.get('source') or '音源'}按需解析超过 {timeout} 秒")
     finally:
         if process.is_alive(): process.terminate()
         process.join(3)

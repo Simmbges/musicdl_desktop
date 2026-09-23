@@ -33,6 +33,7 @@ class App:
         self.search_cache = {}
         self.active_search_key = None
         self.operation = None
+        self.pending_download = None
         self.settings_path = ROOT / 'settings.json'
         try: settings = json.loads(self.settings_path.read_text('utf-8'))
         except (OSError, ValueError): settings = {}
@@ -76,7 +77,7 @@ class App:
         self.entry.bind('<Return>', lambda _: self.begin_search())
         self.search_button = ttk.Button(bar, text='搜索音乐', style='Accent.TButton', command=self.begin_search)
         self.search_button.pack(side='left', padx=10)
-        self.cancel_button = ttk.Button(bar, text='取消任务', command=self.cancel.set, state='disabled')
+        self.cancel_button = ttk.Button(bar, text='取消任务', command=self.cancel_current, state='disabled')
         self.cancel_button.pack(side='left')
         sources = ttk.Frame(body)
         sources.pack(fill='x', pady=(12, 8))
@@ -212,13 +213,14 @@ class App:
     def set_busy(self, value):
         self.busy = value
         self.search_button.configure(state='disabled' if value else 'normal')
-        self.download_button.configure(state='disabled' if value else 'normal')
+        can_download_during_search = value and self.operation == 'search' and bool(self.rows) and not self.pending_download
+        self.download_button.configure(state='normal' if not value or can_download_during_search else 'disabled')
         self.cancel_button.configure(state='normal' if value else 'disabled')
 
     def launch(self, job, operation):
         self.cancel.clear()
-        self.set_busy(True)
         self.operation = operation
+        self.set_busy(True)
         def worker():
             try: job()
             except Exception as exc: self.events.put(('error', str(exc)))
@@ -266,7 +268,7 @@ class App:
         self.active_search_key = cache_key
         self.update_sources()
         timeout = 45 if mode == '快速搜索' else 90
-        self.status.set(f'{mode}中：QQ 目录结果会先显示；每个音源最多等待 {timeout} 秒。')
+        self.status.set(f'{mode}中：所有音源只获取目录词条，点击下载后才解析；单个音源最多等待 {timeout} 秒。')
         self.progress.configure(mode='indeterminate')
         self.progress.start(12)
         self.launch(lambda: search(self.repo, active_sources, keyword, resolve_limit, self.cancel,
@@ -274,48 +276,60 @@ class App:
             catalog_limit=catalog_limit), 'search')
 
     def update_mode_help(self):
-        text = '先解析 5 首 · 单源 45 秒 · 自动跳过近期失败源' if self.search_mode.get() == '快速搜索' else '解析全部结果 · 单源 90 秒'
+        text = '全部点击后解析 · 单源 45 秒 · 跳过近期失败源' if self.search_mode.get() == '快速搜索' else '全部点击后解析 · 单源 90 秒 · 尝试所有源'
         self.mode_help.set(text)
 
     def rebuild_rows(self):
         self.rows = [song for source in SOURCES for song in self.source_rows.get(source, [])]
         self.render()
+        if self.busy: self.set_busy(True)
 
     def render(self):
         self.table.delete(*self.table.get_children())
-        indexes = sorted(range(len(self.rows)), key=lambda i: not lossless(self.rows[i]))
+        is_lossless = lambda song: lossless(song) or bool(song.get('catalog_lossless'))
+        indexes = sorted(range(len(self.rows)), key=lambda i: not is_lossless(self.rows[i]))
         for i in indexes:
             s = self.rows[i]
-            if self.only_lossless.get() and not lossless(s): continue
+            if self.only_lossless.get() and not is_lossless(s): continue
             downloadable = s.get('downloadable', True)
             if not downloadable:
-                quality = '目录有 FLAC · 暂不可下载' if s.get('catalog_lossless') else '暂无可用直链'
+                quality = '目录有无损 · 点击后解析' if s.get('catalog_lossless') else '点击下载时解析'
             else:
                 quality = ('无损 · ' if lossless(s) else '') + str(s.get('ext') or '未知').upper()
                 if s.get('catalog_lossless') and not lossless(s): quality += ' · 目录有 FLAC'
-            tags = ('lossless',) if lossless(s) else (('unavailable',) if not downloadable else ())
+            tags = ('lossless',) if is_lossless(s) else (('unavailable',) if not downloadable else ())
             self.table.insert('', 'end', iid=str(i), values=[s.get('song_name'), s.get('singers'), s.get('album'), quality, s.get('duration'), s.get('file_size'), s['source']], tags=tags)
-        available = sum(s.get('downloadable', True) for s in self.rows)
-        self.count.set(f"显示 {len(self.table.get_children())} / {len(self.rows)} 首 · 可下载 {available} 首 · 无损 {sum(lossless(s) for s in self.rows)} 首")
+        direct = sum(s.get('downloadable', True) for s in self.rows)
+        resolvable = sum(bool(s.get('catalog_item')) and not s.get('downloadable', True) for s in self.rows)
+        self.count.set(f"显示 {len(self.table.get_children())} / {len(self.rows)} 首 · 可下载 {direct + resolvable} 首（待解析 {resolvable}）· 无损 {sum(is_lossless(s) for s in self.rows)} 首")
 
     def update_sources(self):
         self.source_label.configure(text='  /  '.join(f'{s}：{v}' for s, v in self.source_status.items()))
 
     def begin_download(self):
-        if self.busy: return
+        if self.busy and self.operation != 'search': return
         selected = [self.rows[int(i)] for i in self.table.selection()]
         if not selected:
             messagebox.showinfo('选择歌曲', '请先选中需要下载的歌曲。')
             return
         songs = [song for song in selected if song.get('downloadable', True) or song.get('catalog_item')]
         if not songs:
-            messagebox.showinfo('暂无可用下载', '选中的目录结果缺少按需解析信息，请重新搜索或改选其他音源。')
+            messagebox.showinfo('暂无可用下载', '选中的词条缺少按需解析信息，请重新搜索或改选其他音源。')
             return
         directory = self.directory.get().strip()
         if not directory:
             self.choose_directory()
             return
         self.save_settings()
+        if self.busy:
+            self.pending_download = (copy.deepcopy(songs), directory)
+            self.download_button.configure(state='disabled')
+            self.cancel.set()
+            self.status.set(f'已选择 {len(songs)} 首歌曲；正在停止剩余搜索，随后自动解析并下载。')
+            return
+        self.start_download(songs, directory)
+
+    def start_download(self, songs, directory):
         tasks = []
         for song in songs:
             key = self.queue_table.insert('', 'end', values=(song['song_name'], '等待下载', ''))
@@ -333,7 +347,7 @@ class App:
                 try:
                     current = song
                     if not song.get('downloadable', True):
-                        self.events.put(('task', (key, '解析中', '正在按需解析 QQ 下载地址…')))
+                        self.events.put(('task', (key, '解析中', f"正在按需解析{song.get('source') or '音源'}下载地址…")))
                         current = resolve_catalog_song(self.repo, song, self.cancel, timeout=45)
                         self.download_meta[key] = current
                         self.events.put(('task', (key, '下载中', '解析成功，正在连接…')))
@@ -347,6 +361,10 @@ class App:
                 except Exception as exc:
                     self.events.put(('task', (key, '失败', str(exc))))
         self.launch(job, 'download')
+
+    def cancel_current(self):
+        self.pending_download = None
+        self.cancel.set()
 
     def poll(self):
         for _ in range(200):
@@ -369,7 +387,7 @@ class App:
                 else:
                     health.update(failures=0, cooldown_until=0)
                 existing = self.source_rows.get(source, [])
-                if source == 'QQ音乐' and failed and not songs and existing:
+                if failed and not songs and existing:
                     songs = existing
                     status = f'{len(existing)} 首目录结果 · 链接解析失败，双击下载时可重试'
                 self.source_rows[source] = songs
@@ -389,6 +407,9 @@ class App:
             elif kind == 'error':
                 messagebox.showerror('任务失败', data)
             elif kind == 'done':
+                completed_operation = self.operation
+                queued_download = self.pending_download if completed_operation == 'search' else None
+                self.pending_download = None
                 self.progress.stop()
                 self.set_busy(False)
                 if self.operation == 'search' and self.active_search_key and not self.cancel.is_set():
@@ -397,11 +418,21 @@ class App:
                         oldest = min(self.search_cache, key=lambda key: self.search_cache[key][0])
                         self.search_cache.pop(oldest, None)
                 self.active_search_key = None
-                self.status.set('任务已取消。' if self.cancel.is_set() else '任务结束。搜索结果已缓存 15 分钟；下载结果见下方记录。')
                 self.operation = None
+                if queued_download:
+                    self.start_download(*queued_download)
+                else:
+                    if self.cancel.is_set():
+                        message = '任务已取消。'
+                    elif completed_operation == 'search':
+                        message = '搜索结束，结果已缓存 15 分钟。'
+                    else:
+                        message = '下载任务结束，结果见下方记录。'
+                    self.status.set(message)
         self.root.after(100, self.poll)
 
     def close(self):
+        self.pending_download = None
         self.cancel.set()
         self.save_settings()
         if self.busy:

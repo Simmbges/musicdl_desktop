@@ -2,16 +2,19 @@
 import io
 import json
 from pathlib import Path
+import queue
+import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 from unittest.mock import Mock, patch
 import ssl
 import urllib.error
 import wave
 import tkinter as tk
-from backend import download, Cancelled, lossless, qq_catalog_row, qq_catalog_search, resolve_catalog_song, search, DEFAULT_REPO
+from backend import download, Cancelled, lossless, qq_catalog_row, resolve_catalog_song, search, source_worker, DEFAULT_REPO, SOURCES
 
 
 def wav_bytes():
@@ -110,24 +113,42 @@ class Checks(unittest.TestCase):
         self.assertFalse(row['downloadable'])
         self.assertEqual(row['catalog_item']['mid'], 'song-mid')
 
-    def test_qq_catalog_limit_is_independent_and_restored(self):
-        class Response:
-            def json(self):
-                return {'music.search.SearchCgiService.DoSearchForQQMusicMobile': {'data': {'body': {'item_song': [
-                    {'title': f'歌曲{i}', 'mid': str(i), 'file': {}} for i in range(10)
-                ]}}}}
-        class Client:
-            search_size_per_source = 3
-            search_size_per_page = 3
-            def _constructsearchurls(self, keyword, request_overrides):
-                self.seen_limits = (self.search_size_per_source, self.search_size_per_page)
-                return [{'url': 'https://example.test', 'page_no': 1}]
-            def post(self, url, **kwargs): return Response()
-        client = Client()
-        rows = qq_catalog_search(client, '测试', 10)
-        self.assertEqual(client.seen_limits, (10, 10))
-        self.assertEqual((client.search_size_per_source, client.search_size_per_page), (3, 3))
-        self.assertEqual(len(rows), 10)
+    def test_all_source_workers_only_return_catalog_rows(self):
+        items = {
+            '网易云': {'name': '晴天', 'id': 'ne', 'dt': 269000, 'ar': [{'name': '周杰伦'}], 'al': {'name': '叶惠美'}, 'sq': {'size': 55397039}},
+            'QQ音乐': {'title': '晴天', 'mid': 'qq', 'interval': 269, 'singer': [{'name': '周杰伦'}], 'album': {'title': '叶惠美'}, 'file': {'size_flac': 55397039}},
+            '酷狗': {'SongName': '晴天', 'FileHash': 'kg', 'Duration': 269, 'SingerName': '周杰伦', 'AlbumName': '叶惠美', 'SQFileSize': 55397039},
+            '酷我': {'SONGNAME': '晴天', 'MUSICRID': 'MUSIC_kw', 'DURATION': 269, 'ARTIST': '周杰伦', 'ALBUM': '叶惠美', 'FORMATS': 'mp3|flac'},
+            '咪咕': {'name': '晴天', 'contentId': 'mg', 'copyrightId': 'cp', 'singers': [{'name': '周杰伦'}], 'album': '叶惠美', 'rateFormats': [{'formatType': 'SQ', 'size': '52MB'}]},
+            '千千': {'title': '晴天', 'TSID': 'qy', 'artist': [{'name': '周杰伦'}], 'albumTitle': '叶惠美'},
+            '街声': {'title': '晴天', 'song_id': 'sv', 'artist': '周杰伦'},
+            'ccMixter': {'title': 'Piano', 'identifier': 'cc', 'creator': 'Artist', 'album': 'Album', 'duration': 269, 'download_url': 'https://example.test/a.mp3'},
+        }
+        class FakeSong:
+            def __init__(self, **kwargs): self.__dict__.update(kwargs)
+            @property
+            def with_valid_download_url(self): return True
+        for source, item in items.items():
+            with self.subTest(source=source):
+                class Client:
+                    def __init__(self):
+                        self.source = source
+                        self.search_size_per_source = self.search_size_per_page = 5
+                    def search(self, *args, **kwargs):
+                        return [self._parsewithofficialapiv1(search_result=item)]
+                client = Client()
+                fake_modules = types.ModuleType('musicdl.modules')
+                fake_modules.BuildMusicClient = lambda module_cfg: client
+                fake_modules.SongInfo = FakeSong
+                channel = queue.Queue()
+                with patch.dict(sys.modules, {'musicdl': types.ModuleType('musicdl'), 'musicdl.modules': fake_modules}):
+                    source_worker('', source, '测试', 5, 5, channel)
+                done = channel.get_nowait()
+                self.assertEqual(done[0], 'done')
+                self.assertEqual(done[1][0]['source'], source)
+                self.assertFalse(done[1][0]['downloadable'])
+                self.assertEqual(done[1][0]['catalog_item'], item)
+                self.assertIn('等待按需解析', done[2])
 
     def test_window_and_events(self):
         from app import App
@@ -145,9 +166,23 @@ class Checks(unittest.TestCase):
         self.assertEqual(len(app.table.get_children()), 1)
         app.only_lossless.set(False)
         catalog = qq_catalog_row({'title': '目录歌曲', 'mid': 'catalog-mid', 'file': {'size_flac': 1234}})
+        app.operation = 'search'
+        app.set_busy(True)
         app.events.put(('source_partial', ('QQ音乐', [catalog], '1 首目录结果')))
         app.poll()
         self.assertEqual(len(app.table.get_children()), 2)
+        self.assertEqual(str(app.download_button['state']), 'normal')
+        self.assertIn('点击后解析', app.table.set(str(app.rows.index(catalog)), 3))
+        app.table.selection_set(str(app.rows.index(catalog)))
+        with patch.object(app, 'save_settings'):
+            app.begin_download()
+        self.assertTrue(app.cancel.is_set())
+        self.assertEqual(app.pending_download[0][0]['identifier'], 'catalog-mid')
+        with patch.object(app, 'start_download') as start_download:
+            app.events.put(('done', None))
+            app.poll()
+            start_download.assert_called_once()
+        self.assertIsNone(app.pending_download)
         app.events.put(('source', ('QQ音乐', [], '超时，请稍后重试')))
         app.poll()
         self.assertEqual(len(app.table.get_children()), 2)
@@ -161,6 +196,11 @@ class Checks(unittest.TestCase):
         app.poll()
         self.assertEqual(app.source_health['咪咕']['failures'], 2)
         self.assertGreater(app.source_health['咪咕']['cooldown_until'], time.monotonic())
+        app.operation = 'download'
+        app.cancel.clear()
+        app.events.put(('done', None))
+        app.poll()
+        self.assertEqual(app.status.get(), '下载任务结束，结果见下方记录。')
         failed = app.queue_table.insert('', 'end', values=('失败歌曲', '失败', 'HTTP Error 403'))
         app.download_meta[failed] = dict(song_name='失败歌曲', singers='歌手', source='酷我', ext='flac')
         report = app.failure_report()
@@ -177,7 +217,19 @@ class Checks(unittest.TestCase):
 
 if __name__ == '__main__':
     import sys
-    if '--qq-fast-live' in sys.argv:
+    if '--catalog-live' in sys.argv:
+        report, started = {}, time.monotonic()
+        def emit_catalog(kind, data):
+            source, songs, status = data
+            if kind == 'source': report[source] = songs
+            print(f'{time.monotonic() - started:.1f}秒', source, status, len(songs), flush=True)
+        search(DEFAULT_REPO, [source for source in SOURCES if source != 'ccMixter'], '晴天 周杰伦', 3, threading.Event(), emit_catalog, timeout=45, catalog_limit=3)
+        search(DEFAULT_REPO, ['ccMixter'], 'piano', 3, threading.Event(), emit_catalog, timeout=45, catalog_limit=3)
+        for source, songs in report.items():
+            if any(song.get('downloadable', True) for song in songs):
+                raise RuntimeError(f'{source}在搜索阶段提前生成了下载地址')
+        print(json.dumps({source: len(songs) for source, songs in report.items()}, ensure_ascii=False), flush=True)
+    elif '--qq-fast-live' in sys.argv:
         final_rows, started = [], time.monotonic()
         def emit_fast(kind, data):
             source, songs, status = data
@@ -195,10 +247,10 @@ if __name__ == '__main__':
             candidates.extend(songs)
             print(f'{time.monotonic() - started:.1f}秒', kind, source, status, [(s.get('song_name'), s.get('ext'), s.get('file_size'), s.get('downloadable')) for s in songs], flush=True)
         search(DEFAULT_REPO, ['QQ音乐'], '晴天 周杰伦', 3, threading.Event(), emit_qq, timeout=45, catalog_limit=10)
-        target = next((song for song in candidates if song.get('downloadable') and lossless(song)), None)
-        if not target:
-            raise RuntimeError('未找到 QQ 可下载无损测试结果')
-        path = download(target, Path('verification-downloads'), threading.Event(), lambda *_: None)
+        target = next((song for song in candidates if not song.get('downloadable')), None)
+        if not target: raise RuntimeError('未找到 QQ 目录结果')
+        resolved = resolve_catalog_song(DEFAULT_REPO, target, threading.Event(), timeout=45)
+        path = download(resolved, Path('verification-downloads'), threading.Event(), lambda *_: None)
         print('下载成功', path.name, path.stat().st_size, flush=True)
     elif '--kugou-live' in sys.argv:
         candidates = []
@@ -207,11 +259,11 @@ if __name__ == '__main__':
             candidates.extend(songs)
             print(source, status, flush=True)
         search(DEFAULT_REPO, ['酷狗'], '晴天 周杰伦', 3, threading.Event(), emit_kugou, timeout=75)
-        target = next((song for song in candidates if song.get('song_name') == '晴天' and lossless(song)), None)
-        if not target:
-            raise RuntimeError('未找到酷狗无损测试结果')
-        path = download(target, Path('verification-downloads'), threading.Event(), lambda *_: None)
-        print('下载成功', path.name, path.stat().st_size, target.get('_download_note', ''), flush=True)
+        target = next((song for song in candidates if song.get('song_name') == '晴天'), None)
+        if not target: raise RuntimeError('未找到酷狗目录结果')
+        resolved = resolve_catalog_song(DEFAULT_REPO, target, threading.Event(), timeout=45)
+        path = download(resolved, Path('verification-downloads'), threading.Event(), lambda *_: None)
+        print('下载成功', path.name, path.stat().st_size, resolved.get('_download_note', ''), flush=True)
     elif '--live' in sys.argv:
         report = []
         candidates = []
@@ -221,11 +273,12 @@ if __name__ == '__main__':
             candidates.extend(songs)
             print(source, status, flush=True)
         search(DEFAULT_REPO, ['网易云', 'QQ音乐', '酷狗', '酷我', 'ccMixter'], 'piano', 3, threading.Event(), emit, timeout=75)
-        for song in sorted(candidates, key=lambda s: not lossless(s))[:3]:
+        for song in sorted(candidates, key=lambda s: not s.get('catalog_lossless'))[:3]:
             try:
-                path = download(song, Path('verification-downloads'), threading.Event(), lambda *_: None)
-                report.append(dict(download='成功', source=song['source'], format=song['ext'], size=path.stat().st_size, file=str(path)))
-                print('下载成功', song['source'], song['ext'], path.stat().st_size, flush=True)
+                resolved = resolve_catalog_song(DEFAULT_REPO, song, threading.Event(), timeout=45)
+                path = download(resolved, Path('verification-downloads'), threading.Event(), lambda *_: None)
+                report.append(dict(download='成功', source=resolved['source'], format=resolved['ext'], size=path.stat().st_size, file=str(path)))
+                print('下载成功', resolved['source'], resolved['ext'], path.stat().st_size, flush=True)
                 break
             except Exception as exc:
                 report.append(dict(download='失败', source=song['source'], error=str(exc)))
