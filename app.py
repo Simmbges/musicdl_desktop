@@ -87,6 +87,7 @@ class App:
         ttk.Label(filters, textvariable=self.count).pack(side='right')
         self.table = self.make_table(body, ['歌曲', '歌手', '专辑', '音质 / 格式', '时长', '大小', '来源'], [250, 160, 180, 120, 75, 85, 90], height=8)
         self.table.tag_configure('lossless', foreground='#087566')
+        self.table.tag_configure('unavailable', foreground='#8a7770')
         self.table.bind('<Double-1>', lambda _: self.begin_download())
         actions = ttk.Frame(body)
         actions.pack(fill='x', pady=10)
@@ -233,19 +234,32 @@ class App:
         for i in indexes:
             s = self.rows[i]
             if self.only_lossless.get() and not lossless(s): continue
-            quality = ('无损 · ' if lossless(s) else '') + str(s.get('ext') or '未知').upper()
-            self.table.insert('', 'end', iid=str(i), values=[s.get('song_name'), s.get('singers'), s.get('album'), quality, s.get('duration'), s.get('file_size'), s['source']], tags=('lossless',) if lossless(s) else ())
-        self.count.set(f"显示 {len(self.table.get_children())} / {len(self.rows)} 首 · 无损 {sum(lossless(s) for s in self.rows)} 首")
+            downloadable = s.get('downloadable', True)
+            if not downloadable:
+                quality = '目录有 FLAC · 暂不可下载' if s.get('catalog_lossless') else '暂无可用直链'
+            else:
+                quality = ('无损 · ' if lossless(s) else '') + str(s.get('ext') or '未知').upper()
+                if s.get('catalog_lossless') and not lossless(s): quality += ' · 目录有 FLAC'
+            tags = ('lossless',) if lossless(s) else (('unavailable',) if not downloadable else ())
+            self.table.insert('', 'end', iid=str(i), values=[s.get('song_name'), s.get('singers'), s.get('album'), quality, s.get('duration'), s.get('file_size'), s['source']], tags=tags)
+        available = sum(s.get('downloadable', True) for s in self.rows)
+        self.count.set(f"显示 {len(self.table.get_children())} / {len(self.rows)} 首 · 可下载 {available} 首 · 无损 {sum(lossless(s) for s in self.rows)} 首")
 
     def update_sources(self):
         self.source_label.configure(text='  /  '.join(f'{s}：{v}' for s, v in self.source_status.items()))
 
     def begin_download(self):
         if self.busy: return
-        songs = [self.rows[int(i)] for i in self.table.selection()]
-        if not songs:
+        selected = [self.rows[int(i)] for i in self.table.selection()]
+        if not selected:
             messagebox.showinfo('选择歌曲', '请先选中需要下载的歌曲。')
             return
+        songs = [song for song in selected if song.get('downloadable', True)]
+        if not songs:
+            messagebox.showinfo('暂无可用下载', 'QQ 已找到歌曲，但当前没有可下载直链。目录标注有 FLAC 不代表未登录账号可以下载；请改选其他音源。')
+            return
+        if len(songs) != len(selected):
+            self.status.set(f'已跳过 {len(selected) - len(songs)} 首仅有目录信息的歌曲。')
         directory = self.directory.get().strip()
         if not directory:
             self.choose_directory()

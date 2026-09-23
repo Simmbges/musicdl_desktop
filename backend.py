@@ -28,6 +28,43 @@ def lossless(song):
     return str(song.get('ext') or '').lower().lstrip('.') in LOSSLESS or str(song.get('codec') or '').lower() == 'alac'
 
 
+def qq_catalog_row(item):
+    """Convert a QQ search item to a visible, non-downloadable catalog row."""
+    file_info = item.get('file') or {}
+    def numeric_size(value):
+        try: return int(value or 0)
+        except (TypeError, ValueError): return 0
+    lossless_bytes = max((numeric_size(file_info.get(key)) for key in ('size_flac', 'size_hires', 'size_new')), default=0)
+    singers = ', '.join(singer.get('name', '') for singer in (item.get('singer') or []) if singer.get('name'))
+    album = item.get('album') or {}
+    duration = int(float(item.get('interval') or 0))
+    return {
+        'song_name': re.sub(r'<[^>]+>', '', str(item.get('title') or item.get('songname') or '未知歌曲')),
+        'singers': singers, 'album': album.get('title') or item.get('albumname'),
+        'ext': '', 'codec': '', 'duration': time.strftime('%M:%S', time.gmtime(duration)),
+        'file_size': f'{lossless_bytes / 1048576:.2f} MB' if lossless_bytes else '',
+        'download_url': '', 'protocol': 'HTTP', 'identifier': str(item.get('mid') or item.get('songmid') or ''),
+        'downloaded_contents': None, 'source': 'QQ音乐', 'downloadable': False,
+        'catalog_lossless': bool(lossless_bytes),
+        'requires_rights': bool((item.get('pay') or {}).get('pay_play')),
+    }
+
+
+def qq_catalog_search(client, keyword, limit):
+    """Read official QQ metadata so unresolved songs do not disappear from search."""
+    rows = []
+    for search_meta in client._constructsearchurls(keyword, request_overrides={}):
+        search_meta = dict(search_meta)
+        url = search_meta.pop('url')
+        search_meta.pop('page_no', None)
+        response = client.post(url, **search_meta)
+        items = response.json()['music.search.SearchCgiService.DoSearchForQQMusicMobile']['data']['body']['item_song']
+        rows.extend(qq_catalog_row(item) for item in items)
+        if len(rows) >= limit:
+            break
+    return rows[:limit]
+
+
 class SearchLog:
     def __init__(self):
         self.errors = 0
@@ -47,7 +84,9 @@ def source_worker(repo, source, keyword, limit, channel):
                 client = BuildMusicClient(module_cfg=dict(type=SOURCES[source], work_dir=cache,
                     search_size_per_source=limit, search_size_per_page=limit,
                     max_retries=1, disable_print=True, logger_handle=logger))
-                songs = client.search(keyword, num_threadings=3, request_overrides={'timeout': (8, 15)})
+                # Many musicdl parsers set their own timeout. Passing another timeout
+                # here breaks them with "multiple values for keyword argument".
+                songs = client.search(keyword, num_threadings=3, request_overrides={})
                 results = []
                 for song in songs:
                     if not song.with_valid_download_url:
@@ -60,8 +99,25 @@ def source_worker(repo, source, keyword, limit, channel):
                     row['headers'] = song.default_download_headers or client.default_download_headers
                     row['cookies'] = song.default_download_cookies or client.default_download_cookies
                     row['source'] = source
+                    row['downloadable'] = True
+                    if source == 'QQ音乐':
+                        catalog = qq_catalog_row((song.raw_data or {}).get('search') or {})
+                        row['catalog_lossless'] = catalog['catalog_lossless']
+                        row['requires_rights'] = catalog['requires_rights']
                     results.append(row)
-                channel.put((results, f'{len(results)} 首' + (f' · {logger.errors} 次接口错误' if logger.errors else '')))
+                if source == 'QQ音乐':
+                    try:
+                        existing = {str(row.get('identifier') or '') for row in results}
+                        results.extend(row for row in qq_catalog_search(client, keyword, limit) if row['identifier'] not in existing)
+                    except Exception:
+                        logger.errors += 1
+                downloadable = sum(row.get('downloadable', True) for row in results)
+                actual_lossless = sum(lossless(row) and row.get('downloadable', True) for row in results)
+                catalog_only = len(results) - downloadable
+                status = f'{downloadable} 首可下载 · {actual_lossless} 首无损'
+                if catalog_only: status += f' · {catalog_only} 首仅目录'
+                if logger.errors: status += f' · {logger.errors} 次接口错误'
+                channel.put((results, status))
     except Exception as exc:
         channel.put(([], f'不可用：{type(exc).__name__}: {exc}'[:220]))
 

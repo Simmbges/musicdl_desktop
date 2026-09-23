@@ -10,7 +10,7 @@ import ssl
 import urllib.error
 import wave
 import tkinter as tk
-from backend import download, Cancelled, lossless, search, DEFAULT_REPO
+from backend import download, Cancelled, lossless, qq_catalog_row, search, DEFAULT_REPO
 
 
 def wav_bytes():
@@ -96,6 +96,16 @@ class Checks(unittest.TestCase):
         self.assertFalse(lossless({'ext': 'm4a'}))
         self.assertFalse(lossless({'ext': 'mp3'}))
 
+    def test_qq_catalog_row_exposes_unavailable_lossless(self):
+        row = qq_catalog_row({'title': '晴天', 'mid': 'song-mid', 'interval': 269,
+            'singer': [{'name': '周杰伦'}], 'album': {'title': '叶惠美'},
+            'file': {'size_flac': 55397039, 'size_new': []}, 'pay': {'pay_play': 1}})
+        self.assertEqual(row['song_name'], '晴天')
+        self.assertEqual(row['duration'], '04:29')
+        self.assertTrue(row['catalog_lossless'])
+        self.assertTrue(row['requires_rights'])
+        self.assertFalse(row['downloadable'])
+
     def test_window_and_events(self):
         from app import App
         root = tk.Tk()
@@ -124,7 +134,19 @@ class Checks(unittest.TestCase):
 
 if __name__ == '__main__':
     import sys
-    if '--kugou-live' in sys.argv:
+    if '--qq-live' in sys.argv:
+        candidates = []
+        def emit_qq(kind, data):
+            source, songs, status = data
+            candidates.extend(songs)
+            print(source, status, [(s.get('song_name'), s.get('ext'), s.get('file_size'), s.get('downloadable')) for s in songs], flush=True)
+        search(DEFAULT_REPO, ['QQ音乐'], '晴天 周杰伦', 3, threading.Event(), emit_qq, timeout=90)
+        target = next((song for song in candidates if song.get('downloadable') and lossless(song)), None)
+        if not target:
+            raise RuntimeError('未找到 QQ 可下载无损测试结果')
+        path = download(target, Path('verification-downloads'), threading.Event(), lambda *_: None)
+        print('下载成功', path.name, path.stat().st_size, flush=True)
+    elif '--kugou-live' in sys.argv:
         candidates = []
         def emit_kugou(kind, data):
             source, songs, status = data
