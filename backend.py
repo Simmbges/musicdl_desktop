@@ -16,8 +16,8 @@ import urllib.error
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 
-ROOT = Path(__file__).resolve().parent
-DEFAULT_REPO = ROOT.parent.parent / 'musicdl-master'
+ROOT = Path(sys.executable).resolve().parent if getattr(sys, 'frozen', False) else Path(__file__).resolve().parent
+DEFAULT_REPO = Path(sys._MEIPASS) / 'musicdl-master' if getattr(sys, 'frozen', False) else ROOT.parent.parent / 'musicdl-master'
 SOURCES = {'网易云': 'NeteaseMusicClient', 'QQ音乐': 'QQMusicClient',
            '酷狗': 'KugouMusicClient', '酷我': 'KuwoMusicClient',
            '咪咕': 'MiguMusicClient', '千千': 'QianqianMusicClient',
@@ -36,6 +36,8 @@ def clean_text(value):
 
 
 def numeric_size(value):
+    if isinstance(value, (list, tuple)):
+        return max((numeric_size(item) for item in value), default=0)
     try:
         text = str(value or 0).strip()
         if text.upper().endswith('MB'): return int(float(text[:-2].strip()) * 1048576)
@@ -143,7 +145,7 @@ class SearchLog:
 def song_row(song, client, source):
     row = {key: getattr(song, key, None) for key in (
         'song_name', 'singers', 'album', 'ext', 'codec', 'duration', 'file_size',
-        'download_url', 'protocol', 'identifier', 'downloaded_contents')}
+        'download_url', 'protocol', 'identifier', 'downloaded_contents', 'lyric', 'cover_url')}
     if row['protocol'] != 'HTTP' or not isinstance(row['download_url'], str):
         return None
     row['headers'] = song.default_download_headers or client.default_download_headers
@@ -241,6 +243,10 @@ def resolve_worker(repo, catalog_song, channel):
                         lossless_quality_is_sufficient=True, request_overrides={})
                 resolved = resolved if resolved.with_valid_download_url else third_party
                 if not resolved.with_valid_download_url: raise ValueError(f'{source}当前未返回可下载地址，请改选其他音源')
+                if resolved is not third_party:
+                    if str(resolved.lyric or '').strip().lower() in {'', 'null', 'none'}:
+                        resolved.lyric = third_party.lyric
+                    resolved.cover_url = resolved.cover_url or third_party.cover_url
                 if str(resolved.protocol or '').upper() == 'HLS':
                     resolved.work_dir = cache
                     downloaded = client.download([resolved], num_threadings=1, request_overrides={}, auto_supplement_song=False)
@@ -312,6 +318,39 @@ def filename(song):
     return name + '.' + ext
 
 
+def fill_flac_metadata(audio, song, cancel):
+    """Fill missing FLAC tags and artwork from the selected source's resolved song."""
+    from mutagen.flac import Picture
+    changed = False
+    for tag, field in (('TITLE', 'song_name'), ('ARTIST', 'singers'), ('ALBUM', 'album')):
+        value = clean_text(song.get(field))
+        if value and not audio.get(tag):
+            audio[tag] = value
+            changed = True
+    lyric = str(song.get('lyric') or '').replace('\r\n', '\n').strip()
+    if lyric.lower() not in {'', 'null', 'none'} and not audio.get('LYRICS'):
+        audio['LYRICS'] = lyric
+        changed = True
+    cover_url = str(song.get('cover_url') or '')
+    if cover_url.startswith(('http://', 'https://')) and not audio.pictures:
+        try:
+            request = urllib.request.Request(cover_url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(request, timeout=10) as response:
+                data = response.read(5 * 1024 * 1024 + 1)
+            mime = 'image/jpeg' if data.startswith(b'\xff\xd8\xff') else 'image/png' if data.startswith(b'\x89PNG\r\n\x1a\n') else ''
+            if mime and len(data) <= 5 * 1024 * 1024:
+                picture = Picture()
+                picture.type, picture.mime, picture.data = 3, mime, data
+                audio.add_picture(picture)
+                changed = True
+            else:
+                song['_download_note'] = (song.get('_download_note', '') + ' · 封面图片格式不支持或过大').strip(' ·')
+        except (OSError, ValueError):
+            song['_download_note'] = (song.get('_download_note', '') + ' · 封面暂不可用').strip(' ·')
+    if cancel.is_set(): raise Cancelled()
+    if changed: audio.save()
+
+
 def download(song, directory, cancel, progress):
     directory = Path(directory).expanduser().resolve()
     directory.mkdir(parents=True, exist_ok=True)
@@ -349,6 +388,7 @@ def download(song, directory, cancel, progress):
         # Check the actual parsed container, not merely the advertised suffix.
         actual_lossless = type(audio).__name__ in {'FLAC', 'WAVE', 'AIFF', 'MonkeysAudio', 'WavPack', 'TrueAudio', 'DSF', 'DSDIFF'} or getattr(audio.info, 'codec', '') == 'alac'
         if lossless(song) and not actual_lossless: raise ValueError('实际音频与来源标注的无损格式不一致')
+        if type(audio).__name__ == 'FLAC': fill_flac_metadata(audio, song, cancel)
         for number in range(10000):
             destination = target if number == 0 else target.with_stem(target.stem + f' ({number})')
             try:

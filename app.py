@@ -37,7 +37,9 @@ class App:
         self.settings_path = ROOT / 'settings.json'
         try: settings = json.loads(self.settings_path.read_text('utf-8'))
         except (OSError, ValueError): settings = {}
-        self.repo = settings.get('repo', str(DEFAULT_REPO))
+        self.repo = settings.get('repo') or str(DEFAULT_REPO)
+        if getattr(sys, 'frozen', False) and not (Path(self.repo) / 'musicdl' / 'musicdl.py').is_file():
+            self.repo = str(DEFAULT_REPO)
         self.directory = tk.StringVar(value=settings.get('directory', str(ROOT / '下载音乐')))
         self.query = tk.StringVar()
         self.only_lossless = tk.BooleanVar(value=False)
@@ -104,7 +106,7 @@ class App:
         results_header.pack(fill='x', pady=(5, 6))
         ttk.Label(results_header, text='搜索结果', font=('Microsoft YaHei UI', 11, 'bold')).pack(side='left')
         ttk.Label(results_header, textvariable=self.count).pack(side='right')
-        self.table = self.make_table(body, ['歌曲', '歌手', '专辑', '音质 / 格式', '时长', '大小', '来源'], [250, 160, 180, 120, 75, 85, 90], height=12)
+        self.table = self.make_table(body, ['歌曲', '歌手', '专辑', '音质 / 格式', '时长', '预计大小', '来源'], [250, 160, 180, 120, 75, 85, 90], height=12)
         self.table.tag_configure('lossless', foreground='#087566')
         self.table.tag_configure('unavailable', foreground='#8a7770')
         self.table.bind('<Double-1>', lambda _: self.begin_download())
@@ -167,7 +169,8 @@ class App:
         self.queue_summary.set(f'{len(keys)} 首 · 已完成 {completed} · 失败 {failed}' if keys else '暂无下载任务')
 
     def save_settings(self):
-        data = dict(repo=self.repo, directory=self.directory.get(),
+        data = dict(repo='' if getattr(sys, 'frozen', False) and self.repo == str(DEFAULT_REPO) else self.repo,
+            directory=self.directory.get(),
             sources=[s for s, v in self.source_vars.items() if v.get()],
             search_mode=self.search_mode.get(), limit=self.limit.get())
         temporary = self.settings_path.with_suffix('.tmp')

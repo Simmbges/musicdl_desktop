@@ -3,12 +3,14 @@ import io
 import json
 from pathlib import Path
 import queue
+import struct
 import sys
 import tempfile
 import threading
 import time
 import types
 import unittest
+import zlib
 from unittest.mock import Mock, patch
 import ssl
 import urllib.error
@@ -37,6 +39,36 @@ class Checks(unittest.TestCase):
             second = download(self.song(), folder, threading.Event(), lambda *_: None)
             self.assertNotEqual(first, second)
             self.assertEqual(first.read_bytes(), wav_bytes())
+
+    def test_flac_tags_cover_and_lyrics(self):
+        from mutagen.flac import FLAC
+        def chunk(kind, data):
+            return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data))
+        cover = (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', 1, 1, 8, 2, 0, 0, 0))
+            + chunk(b'IDAT', zlib.compress(b'\x00\xff\x00\x00')) + chunk(b'IEND', b''))
+        with tempfile.TemporaryDirectory() as folder:
+            source = next((Path(__file__).resolve().parent / 'verification-downloads').glob('Piano*.flac'))
+            blank = Path(folder) / 'blank.flac'
+            blank.write_bytes(source.read_bytes())
+            audio = FLAC(blank)
+            original_md5 = audio.info.md5_signature
+            for key in ('TITLE', 'ARTIST', 'ALBUM'):
+                audio.pop(key, None)
+            audio.save()
+            song = dict(song_name='测试歌', singers='测试歌手', album='测试专辑', source='测试', ext='flac',
+                lyric='[00:01.00]测试歌词', cover_url='https://example.test/cover.png', downloaded_contents=blank.read_bytes())
+            with patch('urllib.request.urlopen', return_value=io.BytesIO(cover)):
+                result = download(song, folder, threading.Event(), lambda *_: None)
+            tagged = FLAC(result)
+            self.assertEqual(tagged.info.md5_signature, original_md5)
+            self.assertEqual(tagged['TITLE'], ['测试歌'])
+            self.assertEqual(tagged['ARTIST'], ['测试歌手'])
+            self.assertEqual(tagged['ALBUM'], ['测试专辑'])
+            self.assertEqual(tagged['LYRICS'], ['[00:01.00]测试歌词'])
+            self.assertEqual(tagged.pictures[0].data, cover)
+            self.assertEqual(tagged.pictures[0].type, 3)
+            self.assertEqual(tagged.pictures[0].mime, 'image/png')
+            self.assertFalse(result.with_suffix('.lrc').exists())
 
     def test_invalid_audio_cleanup(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -103,12 +135,13 @@ class Checks(unittest.TestCase):
     def test_qq_catalog_row_exposes_unavailable_lossless(self):
         row = qq_catalog_row({'title': '<em>晴天</em>', 'mid': 'song-mid', 'interval': 269,
             'singer': [{'name': '<em>周杰伦</em>'}], 'album': {'title': '<em>叶惠美</em> &amp; 精选'},
-            'file': {'size_flac': 55397039, 'size_new': []}, 'pay': {'pay_play': 1}})
+            'file': {'size_flac': 55397039, 'size_new': [186980254, 31168013]}, 'pay': {'pay_play': 1}})
         self.assertEqual(row['song_name'], '晴天')
         self.assertEqual(row['singers'], '周杰伦')
         self.assertEqual(row['album'], '叶惠美 & 精选')
         self.assertEqual(row['duration'], '04:29')
         self.assertTrue(row['catalog_lossless'])
+        self.assertEqual(row['file_size'], '178.32 MB')
         self.assertTrue(row['requires_rights'])
         self.assertFalse(row['downloadable'])
         self.assertEqual(row['catalog_item']['mid'], 'song-mid')
@@ -244,7 +277,8 @@ if __name__ == '__main__':
         target = next((song for song in final_rows if not song.get('downloadable')), None)
         if not target: raise RuntimeError('未找到待按需解析的 QQ 目录结果')
         resolved = resolve_catalog_song(DEFAULT_REPO, target, threading.Event(), timeout=45)
-        print('按需解析成功', resolved['song_name'], resolved['ext'], resolved['file_size'], flush=True)
+        print('按需解析成功', resolved['song_name'], resolved['ext'], resolved['file_size'],
+            '封面', bool(resolved.get('cover_url')), '歌词', bool(resolved.get('lyric')), flush=True)
     elif '--qq-live' in sys.argv:
         candidates, started = [], time.monotonic()
         def emit_qq(kind, data):
