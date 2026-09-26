@@ -320,6 +320,21 @@ class Checks(unittest.TestCase):
         copied = root.clipboard_get()
         self.assertIn('失败数量：1', copied)
         self.assertIn('错误：HTTP Error 403', copied)
+        self.assertEqual(str(app.limit['state']), 'normal')
+        app.query.set('测试')
+        app.limit.set('17')
+        with tempfile.TemporaryDirectory() as folder:
+            app.settings_path = Path(folder) / 'settings.json'
+            with patch('app.search') as run_search, patch.object(app, 'launch', side_effect=lambda job, operation: job()):
+                app.begin_search()
+            self.assertEqual(run_search.call_args.kwargs['catalog_limit'], 17)
+            self.assertEqual(json.loads(app.settings_path.read_text('utf-8'))['limit'], '17')
+        for invalid in ('0', '1.5', '无效'):
+            app.limit.set(invalid)
+            with patch('app.messagebox.showinfo') as showinfo, patch('app.search') as run_search:
+                app.begin_search()
+            showinfo.assert_called_once()
+            run_search.assert_not_called()
         root.destroy()
 
 

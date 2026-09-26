@@ -99,7 +99,7 @@ class App:
         self.mode.pack(side='left', padx=(20, 6))
         self.mode.bind('<<ComboboxSelected>>', lambda _: self.update_mode_help())
         ttk.Label(filters, text='每个音源最多').pack(side='left', padx=(20, 5))
-        self.limit = ttk.Combobox(filters, values=['5', '10', '20', '30'], state='readonly', width=4)
+        self.limit = ttk.Combobox(filters, values=['5', '10', '20', '30'], width=5)
         self.limit.set(str(settings.get('limit', '10')))
         self.limit.pack(side='left')
         ttk.Label(filters, text='首').pack(side='left', padx=(6, 14))
@@ -266,8 +266,16 @@ class App:
         if not (Path(self.repo) / 'musicdl' / 'musicdl.py').is_file():
             messagebox.showerror('未找到 musicdl', '请点击“项目位置”选择下载的 musicdl-master 文件夹。')
             return
+        raw_limit = self.limit.get().strip()
+        try: catalog_limit = int(raw_limit) if raw_limit.isdecimal() else 0
+        except ValueError: catalog_limit = 0
+        if catalog_limit < 1:
+            messagebox.showinfo('搜索音乐', '“每个音源最多”请填写大于 0 的整数。')
+            self.limit.focus_set()
+            return
+        self.limit.set(str(catalog_limit))
         self.save_settings()
-        mode, catalog_limit = self.search_mode.get(), int(self.limit.get())
+        mode = self.search_mode.get()
         resolve_limit = min(5, catalog_limit) if mode == '快速搜索' else catalog_limit
         cache_key = (str(Path(self.repo).resolve()), keyword.casefold(), tuple(sources), mode, catalog_limit)
         cached = self.search_cache.get(cache_key)
