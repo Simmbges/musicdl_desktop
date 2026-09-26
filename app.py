@@ -14,7 +14,7 @@ import time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-from backend import ROOT, DEFAULT_REPO, SOURCES, lossless, search, resolve_catalog_song, download, Cancelled
+from backend import ROOT, DEFAULT_REPO, SOURCES, lossless, search, resolve_catalog_song, resolve_quality_options, download, Cancelled
 
 
 class App:
@@ -34,6 +34,8 @@ class App:
         self.active_search_key = None
         self.operation = None
         self.pending_download = None
+        self.pending_quality = None
+        self.quality_result = None
         self.settings_path = ROOT / 'settings.json'
         try: settings = json.loads(self.settings_path.read_text('utf-8'))
         except (OSError, ValueError): settings = {}
@@ -112,10 +114,12 @@ class App:
         self.table.bind('<Double-1>', lambda _: self.begin_download())
         actions = ttk.Frame(body)
         actions.pack(fill='x', pady=10)
-        self.download_button = ttk.Button(actions, text='下载选中歌曲', style='Accent.TButton', command=self.begin_download)
+        self.download_button = ttk.Button(actions, text='下载最高无损', style='Accent.TButton', command=self.begin_download)
         self.download_button.pack(side='left')
+        self.quality_button = ttk.Button(actions, text='选择音质…', command=self.begin_choose_quality)
+        self.quality_button.pack(side='left', padx=(8, 0))
         ttk.Button(actions, text='全选当前结果', command=lambda: self.table.selection_set(self.table.get_children())).pack(side='left', padx=8)
-        ttk.Label(actions, text='Ctrl / Shift 多选 · 双击下载').pack(side='left', padx=8)
+        ttk.Label(actions, text='可多选一键下载 · 双击下载最高无损').pack(side='left', padx=8)
         ttk.Button(actions, text='项目位置', command=self.choose_repo).pack(side='right')
         savebar = ttk.Frame(body)
         savebar.pack(fill='x', pady=(0, 10))
@@ -239,6 +243,7 @@ class App:
         self.search_button.configure(state='disabled' if value else 'normal')
         can_download_during_search = value and self.operation == 'search' and bool(self.rows) and not self.pending_download
         self.download_button.configure(state='normal' if not value or can_download_during_search else 'disabled')
+        self.quality_button.configure(state='normal' if not value or can_download_during_search else 'disabled')
         self.cancel_button.configure(state='normal' if value else 'disabled')
 
     def launch(self, job, operation):
@@ -353,6 +358,72 @@ class App:
             return
         self.start_download(songs, directory)
 
+    def begin_choose_quality(self):
+        if self.busy and self.operation != 'search': return
+        selected = [self.rows[int(i)] for i in self.table.selection()]
+        if len(selected) != 1:
+            messagebox.showinfo('选择音质', '请先选中一首歌曲；多首歌曲可使用“下载最高无损”。')
+            return
+        song = selected[0]
+        if not song.get('catalog_item'):
+            messagebox.showinfo('选择音质', '该词条没有可查询的音质信息，请重新搜索。')
+            return
+        directory = self.directory.get().strip()
+        if not directory:
+            self.choose_directory()
+            return
+        self.save_settings()
+        if self.busy:
+            self.pending_quality = (copy.deepcopy(song), directory)
+            self.quality_button.configure(state='disabled')
+            self.cancel.set()
+            self.status.set('正在停止剩余搜索，随后查询这首歌可用的无损档位。')
+            return
+        self.start_quality_lookup(song, directory)
+
+    def start_quality_lookup(self, song, directory):
+        self.quality_result = None
+        self.status.set(f"正在查询《{song['song_name']}》可用的无损档位…")
+        self.progress.configure(mode='indeterminate')
+        self.progress.start(12)
+        def job():
+            try:
+                options = resolve_quality_options(self.repo, song, self.cancel)
+                self.events.put(('quality_options', (options, directory)))
+            except Cancelled:
+                pass
+            except Exception as exc:
+                self.events.put(('error', f'查询音质失败：{exc}'))
+        self.launch(job, 'quality')
+
+    def show_quality_options(self, options, directory):
+        dialog = tk.Toplevel(self.root)
+        dialog.title('选择无损音质')
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        body = ttk.Frame(dialog, padding=18)
+        body.pack(fill='both', expand=True)
+        ttk.Label(body, text='以下档位已解析到可用的无损地址。实际位深和采样率以下载后核验为准。',
+                  wraplength=540).pack(anchor='w', pady=(0, 10))
+        choices = self.make_table(body, ['音质档位', '格式', '预计大小'], [280, 80, 120], height=min(7, len(options)), expand=False)
+        for index, option in enumerate(options):
+            choices.insert('', 'end', iid=str(index), values=(option['quality_label'], str(option.get('ext') or '').upper(), option.get('file_size') or '未知'))
+        choices.selection_set('0')
+        choices.focus('0')
+        def choose():
+            selected = choices.selection()
+            if not selected: return
+            song = options[int(selected[0])]
+            dialog.destroy()
+            self.start_download([song], directory)
+        buttons = ttk.Frame(body)
+        buttons.pack(fill='x', pady=(12, 0))
+        ttk.Button(buttons, text='下载所选档位', style='Accent.TButton', command=choose).pack(side='left')
+        ttk.Button(buttons, text='取消', command=dialog.destroy).pack(side='right')
+        choices.bind('<Double-1>', lambda _: choose())
+        dialog.grab_set()
+        dialog.focus_set()
+
     def start_download(self, songs, directory):
         tasks = []
         for song in songs:
@@ -377,10 +448,12 @@ class App:
                         current = resolve_catalog_song(self.repo, song, self.cancel, timeout=45)
                         self.download_meta[key] = current
                         self.events.put(('task', (key, '下载中', '解析成功，正在连接…')))
+                    if not lossless(current): raise ValueError('该档位不是无损音频，已停止下载')
                     def progress(done, total): self.events.put(('progress', (key, done, total)))
                     path = download(current, directory, self.cancel, progress)
                     note = current.pop('_download_note', '')
-                    detail = str(path) + (f' · {note}' if note else '')
+                    spec = current.pop('_audio_spec', '')
+                    detail = str(path) + (f' · {spec}' if spec else '') + (f' · {note}' if note else '')
                     self.events.put(('task', (key, '已完成', detail)))
                 except Cancelled:
                     self.events.put(('task', (key, '已取消', '临时文件已清理')))
@@ -433,10 +506,14 @@ class App:
                 self.progress.configure(value=done / total * 100 if total else 0)
             elif kind == 'error':
                 messagebox.showerror('任务失败', data)
+            elif kind == 'quality_options':
+                self.quality_result = data
             elif kind == 'done':
                 completed_operation = self.operation
                 queued_download = self.pending_download if completed_operation == 'search' else None
+                queued_quality = self.pending_quality if completed_operation == 'search' else None
                 self.pending_download = None
+                self.pending_quality = None
                 self.progress.stop()
                 self.set_busy(False)
                 if self.operation == 'search' and self.active_search_key and not self.cancel.is_set():
@@ -448,6 +525,13 @@ class App:
                 self.operation = None
                 if queued_download:
                     self.start_download(*queued_download)
+                elif queued_quality:
+                    self.start_quality_lookup(*queued_quality)
+                elif completed_operation == 'quality' and self.quality_result:
+                    options, directory = self.quality_result
+                    self.quality_result = None
+                    self.status.set(f'找到 {len(options)} 个可用无损档位，请选择。')
+                    self.show_quality_options(options, directory)
                 else:
                     if self.cancel.is_set():
                         message = '任务已取消。'
@@ -460,6 +544,7 @@ class App:
 
     def close(self):
         self.pending_download = None
+        self.pending_quality = None
         self.cancel.set()
         self.save_settings()
         if self.busy:

@@ -1,5 +1,6 @@
 """musicdl adapter and cancellable, verified HTTP downloads."""
 import contextlib
+import copy
 import html
 import io
 import multiprocessing as mp
@@ -97,7 +98,7 @@ def catalog_row(source, item):
         identifier = item.get('contentId')
         duration = item.get('duration') or item.get('length') or 0
         formats = (item.get('rateFormats') or []) + (item.get('newRateFormats') or []) + (item.get('audioFormats') or [])
-        lossless_formats = [meta for meta in formats if isinstance(meta, dict) and str(meta.get('formatType') or '').upper() in {'SQ', 'ZQ', 'FLAC'}]
+        lossless_formats = [meta for meta in formats if isinstance(meta, dict) and str(meta.get('formatType') or '').upper() in {'SQ', 'ZQ', 'ZQ24', 'ZQ32', 'FLAC'}]
         lossless_bytes = max((numeric_size(meta.get('size') or meta.get('iosSize') or meta.get('androidSize')) for meta in lossless_formats), default=0)
         catalog_lossless = bool(lossless_formats)
         if any(isinstance(meta, dict) and str(meta.get('formatType') or '').upper() in {'PQ', 'HQ', 'MP3'} for meta in formats): catalog_format = 'MP3'
@@ -240,8 +241,9 @@ def resolve_worker(repo, catalog_song, channel):
                 resolved = SongInfo(source=client.source)
                 with contextlib.suppress(Exception):
                     resolved = client._parsewithofficialapiv1(search_result=item, song_info_flac=third_party,
-                        lossless_quality_is_sufficient=True, request_overrides={})
-                resolved = resolved if resolved.with_valid_download_url else third_party
+                        lossless_quality_is_sufficient=False, request_overrides={})
+                if not resolved.with_valid_download_url or not lossless({'ext': resolved.ext, 'codec': getattr(resolved, 'codec', '')}):
+                    resolved = third_party
                 if not resolved.with_valid_download_url: raise ValueError(f'{source}当前未返回可下载地址，请改选其他音源')
                 if resolved is not third_party:
                     if str(resolved.lyric or '').strip().lower() in {'', 'null', 'none'}:
@@ -256,6 +258,7 @@ def resolve_worker(repo, catalog_song, channel):
                     resolved.protocol = 'HTTP'
                 row = song_row(resolved, client, source)
                 if not row: raise ValueError(f'{source}返回的音频协议暂不支持')
+                if not lossless(row): raise ValueError(f'{source}当前只返回有损音频，请改选其他音源')
                 channel.put((row, ''))
     except Exception as exc:
         channel.put((None, f'{type(exc).__name__}: {exc}'))
@@ -276,6 +279,116 @@ def resolve_catalog_song(repo, song, cancel, timeout=45):
                 if not process.is_alive(): raise ValueError(f"{song.get('source') or '音源'}解析进程异常退出")
         if cancel.is_set(): raise Cancelled()
         raise TimeoutError(f"{song.get('source') or '音源'}按需解析超过 {timeout} 秒")
+    finally:
+        if process.is_alive(): process.terminate()
+        process.join(3)
+        channel.close()
+
+
+QUALITY_TIERS = {
+    '网易云': [('jymaster', '超清母带'), ('hires', 'Hi-Res'), ('lossless', '标准无损')],
+    'QQ音乐': [('AI00', '臻品母带'), ('Q000', '臻品全景声 2.0'),
+        ('Q001', '臻品全景声 5.1'), ('F000', '标准无损')],
+    '酷狗': [('viper_tape', '蝰蛇母带'), ('viper_clear', '高解析'), ('flac', '标准无损')],
+    '咪咕': [('ZQ32', 'ZQ32'), ('ZQ24', 'ZQ24'), ('ZQ', 'ZQ'), ('SQ', '标准无损')],
+}
+
+
+def quality_worker(repo, catalog_song, channel):
+    """Resolve each supported lossless tier only after the user requests choices."""
+    try:
+        sys.path.insert(0, repo)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            from musicdl.modules import BuildMusicClient, SongInfo
+            source = catalog_song.get('source') or ''
+            if source not in SOURCES: raise ValueError('目录结果缺少有效音源，请重新搜索')
+            item = catalog_song.get('catalog_item') or {}
+            if not item: raise ValueError('目录结果缺少解析信息，请重新搜索')
+            with tempfile.TemporaryDirectory(prefix='shiyin-quality-') as cache:
+                client = BuildMusicClient(module_cfg=dict(type=SOURCES[source], work_dir=cache,
+                    search_size_per_source=1, search_size_per_page=1, max_retries=1,
+                    disable_print=True, logger_handle=SearchLog()))
+                options = []
+                for tier, label in QUALITY_TIERS.get(source, []):
+                    search_item = copy.deepcopy(item)
+                    if source == '咪咕':
+                        for key in ('rateFormats', 'newRateFormats', 'audioFormats'):
+                            search_item[key] = [meta for meta in item.get(key) or []
+                                if isinstance(meta, dict) and str(meta.get('formatType') or '').upper() == tier]
+                        if not any(search_item.get(key) for key in ('rateFormats', 'newRateFormats', 'audioFormats')): continue
+                    if source == 'QQ音乐':
+                        from musicdl.modules.utils.qqutils import SongFileType
+                        old = SongFileType.SORTED_QUALITIES._value_
+                        SongFileType.SORTED_QUALITIES._value_ = [(tier, '.flac')]
+                    elif source in {'网易云', '酷狗'}:
+                        module = sys.modules[client.__class__.__module__]
+                        old = module.MUSIC_QUALITIES
+                        module.MUSIC_QUALITIES = [tier]
+                    try:
+                        result = client._parsewithofficialapiv1(search_result=search_item,
+                            song_info_flac=SongInfo(source=client.source),
+                            lossless_quality_is_sufficient=False, request_overrides={})
+                        if result.with_valid_download_url:
+                            row = song_row(result, client, source)
+                            if row and lossless(row):
+                                row['quality_label'] = label
+                                options.append(row)
+                    except Exception:
+                        pass
+                    finally:
+                        if source == 'QQ音乐': SongFileType.SORTED_QUALITIES._value_ = old
+                        elif source in {'网易云', '酷狗'}: module.MUSIC_QUALITIES = old
+                # Third-party parsers sometimes return a usable FLAC when the official
+                # tier endpoints do not. Preserve that option without inventing its tier.
+                fallback = queue.SimpleQueue()
+                resolve_worker(repo, catalog_song, fallback)
+                best, error = fallback.get()
+                if best and lossless(best):
+                    best['quality_label'] = '自动解析（档位未标明）'
+                if source == 'QQ音乐':
+                    import requests
+                    song_id = item.get('mid') or item.get('songmid')
+                    for tier, label in ((14, '接口标称母带'), (11, '接口标称 Hi-Res'), (10, '接口标称标准无损')):
+                        try:
+                            response = requests.get('https://api.vkeys.cn/music/tencent/song/link',
+                                params={'mid': song_id, 'quality': tier}, timeout=10)
+                            response.raise_for_status()
+                            url = ((response.json().get('data') or {}).get('url') or '')
+                            if not str(url).startswith(('http://', 'https://')): continue
+                            status = client.audio_link_tester.test(url=url, request_overrides={}, renew_session=True)
+                            if str(status.get('ext') or '').lower() not in LOSSLESS: continue
+                            row = dict(best or catalog_song)
+                            row.update(download_url=status['download_url'], ext=status['ext'],
+                                file_size=status.get('file_size') or '', headers=client.default_download_headers,
+                                cookies=client.default_download_cookies, downloadable=True,
+                                quality_label=label)
+                            if not any(existing.get('download_url') == row['download_url'] for existing in options):
+                                options.append(row)
+                        except Exception:
+                            continue
+                if best and not any(row.get('file_size') == best.get('file_size') and row.get('ext') == best.get('ext') for row in options):
+                    options.append(best)
+                if not options: raise ValueError(error or f'{source}当前没有可下载的无损档位')
+                channel.put((options, ''))
+    except Exception as exc:
+        channel.put((None, f'{type(exc).__name__}: {exc}'))
+
+
+def resolve_quality_options(repo, song, cancel, timeout=120):
+    ctx, deadline = mp.get_context('spawn'), time.monotonic() + timeout
+    channel = ctx.Queue()
+    process = ctx.Process(target=quality_worker, args=(str(repo), song, channel), daemon=True)
+    process.start()
+    try:
+        while not cancel.is_set() and time.monotonic() < deadline:
+            try:
+                options, error = channel.get(timeout=0.15)
+                if error: raise ValueError(error)
+                return options
+            except queue.Empty:
+                if not process.is_alive(): raise ValueError('音质查询进程异常退出')
+        if cancel.is_set(): raise Cancelled()
+        raise TimeoutError(f'音质查询超过 {timeout} 秒，请重试或使用“下载最高无损”')
     finally:
         if process.is_alive(): process.terminate()
         process.join(3)
@@ -389,6 +502,9 @@ def download(song, directory, cancel, progress):
         actual_lossless = type(audio).__name__ in {'FLAC', 'WAVE', 'AIFF', 'MonkeysAudio', 'WavPack', 'TrueAudio', 'DSF', 'DSDIFF'} or getattr(audio.info, 'codec', '') == 'alac'
         if lossless(song) and not actual_lossless: raise ValueError('实际音频与来源标注的无损格式不一致')
         if type(audio).__name__ == 'FLAC': fill_flac_metadata(audio, song, cancel)
+        bits = getattr(audio.info, 'bits_per_sample', None)
+        rate = getattr(audio.info, 'sample_rate', None)
+        if bits and rate: song['_audio_spec'] = f'{bits}-bit / {rate / 1000:g} kHz'
         for number in range(10000):
             destination = target if number == 0 else target.with_stem(target.stem + f' ({number})')
             try:

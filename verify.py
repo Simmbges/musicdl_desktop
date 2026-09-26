@@ -16,7 +16,7 @@ import ssl
 import urllib.error
 import wave
 import tkinter as tk
-from backend import download, Cancelled, lossless, qq_catalog_row, resolve_catalog_song, search, source_worker, DEFAULT_REPO, SOURCES
+from backend import catalog_row, download, Cancelled, lossless, qq_catalog_row, quality_worker, resolve_worker, resolve_catalog_song, search, source_worker, DEFAULT_REPO, SOURCES
 
 
 def wav_bytes():
@@ -69,6 +69,65 @@ class Checks(unittest.TestCase):
             self.assertEqual(tagged.pictures[0].type, 3)
             self.assertEqual(tagged.pictures[0].mime, 'image/png')
             self.assertFalse(result.with_suffix('.lrc').exists())
+            self.assertIn('kHz', song['_audio_spec'])
+
+    def test_quality_choices_only_include_resolved_lossless_tiers(self):
+        import backend
+        catalog = {'name': '测试歌', 'contentId': 'song', 'singers': [{'name': '歌手'}],
+            'rateFormats': [{'formatType': 'ZQ24', 'size': '90000000'},
+                {'formatType': 'SQ', 'size': '30000000'}, {'formatType': 'HQ', 'size': '10000000'}]}
+        self.assertTrue(catalog_row('咪咕', dict(catalog, rateFormats=[catalog['rateFormats'][0]]))['catalog_lossless'])
+        class FakeSong:
+            def __init__(self, source, **kwargs):
+                self.__dict__.update(source=source, raw_data={'search': {}},
+                    with_valid_download_url=False, default_download_headers={}, default_download_cookies={})
+                self.__dict__.update(kwargs)
+        class FakeClient:
+            source = 'MiguMusicClient'
+            default_download_headers = {}
+            default_download_cookies = {}
+            def _parsewithofficialapiv1(self, search_result, **kwargs):
+                tier = search_result['rateFormats'][0]['formatType']
+                return FakeSong(self.source, raw_data={'search': search_result}, with_valid_download_url=True,
+                    song_name='测试歌', singers='歌手', album='', ext='mp3' if tier == 'ZQ24' else 'flac',
+                    codec='', duration='03:00', file_size='30 MB', download_url=f'https://example.test/{tier}',
+                    protocol='HTTP', identifier='song', downloaded_contents=None, lyric='', cover_url='')
+        fake_modules = types.ModuleType('musicdl.modules')
+        fake_modules.BuildMusicClient = lambda **kwargs: FakeClient()
+        fake_modules.SongInfo = FakeSong
+        channel = queue.SimpleQueue()
+        with patch.dict(sys.modules, {'musicdl': types.ModuleType('musicdl'), 'musicdl.modules': fake_modules}), \
+             patch.object(backend, 'resolve_worker', side_effect=lambda repo, song, q: q.put((None, '无可用自动档位'))):
+            quality_worker('', dict(source='咪咕', catalog_item=catalog), channel)
+        options, error = channel.get_nowait()
+        self.assertEqual(error, '')
+        self.assertEqual([row['quality_label'] for row in options], ['标准无损'])
+        self.assertEqual(options[0]['download_url'], 'https://example.test/SQ')
+
+    def test_highest_download_keeps_lossless_when_official_is_lossy(self):
+        class FakeSong:
+            def __init__(self, source, ext='', **kwargs):
+                self.__dict__.update(source=source, ext=ext, codec='', with_valid_download_url=bool(ext),
+                    raw_data={'search': {'title': '测试歌'}}, default_download_headers={}, default_download_cookies={},
+                    protocol='HTTP', download_url='https://example.test/audio', lyric='', cover_url='')
+                self.__dict__.update(kwargs)
+        class FakeClient:
+            source = 'QQMusicClient'
+            default_download_headers = {}
+            default_download_cookies = {}
+            def _parsewiththirdpartapis(self, **kwargs):
+                return FakeSong(self.source, ext='flac', song_name='测试歌', singers='歌手')
+            def _parsewithofficialapiv1(self, **kwargs):
+                return FakeSong(self.source, ext='mp3', song_name='测试歌', singers='歌手')
+        fake_modules = types.ModuleType('musicdl.modules')
+        fake_modules.BuildMusicClient = lambda **kwargs: FakeClient()
+        fake_modules.SongInfo = FakeSong
+        channel = queue.SimpleQueue()
+        with patch.dict(sys.modules, {'musicdl': types.ModuleType('musicdl'), 'musicdl.modules': fake_modules}):
+            resolve_worker('', {'source': 'QQ音乐', 'catalog_item': {'title': '测试歌', 'mid': 'song'}}, channel)
+        row, error = channel.get_nowait()
+        self.assertEqual(error, '')
+        self.assertEqual(row['ext'], 'flac')
 
     def test_invalid_audio_cleanup(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -221,6 +280,17 @@ class Checks(unittest.TestCase):
             app.poll()
             start_download.assert_called_once()
         self.assertIsNone(app.pending_download)
+        app.operation = 'search'
+        app.set_busy(True)
+        app.table.selection_set(str(app.rows.index(catalog)))
+        with patch.object(app, 'save_settings'):
+            app.begin_choose_quality()
+        self.assertEqual(app.pending_quality[0]['identifier'], 'catalog-mid')
+        with patch.object(app, 'start_quality_lookup') as start_quality_lookup:
+            app.events.put(('done', None))
+            app.poll()
+            start_quality_lookup.assert_called_once()
+        self.assertIsNone(app.pending_quality)
         app.events.put(('source', ('QQ音乐', [], '超时，请稍后重试')))
         app.poll()
         self.assertEqual(len(app.table.get_children()), 2)
