@@ -1,5 +1,9 @@
 $ErrorActionPreference = 'Stop'
-$source = (Resolve-Path (Join-Path $PSScriptRoot '..\..\musicdl-master')).Path
+$sourcePath = Join-Path $PSScriptRoot '..\musicdl-master'
+if (-not (Test-Path -LiteralPath (Join-Path $sourcePath 'musicdl\musicdl.py'))) {
+    $sourcePath = Join-Path $PSScriptRoot '..\..\musicdl-master'
+}
+$source = (Resolve-Path $sourcePath).Path
 $python = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'
 if (-not (Test-Path -LiteralPath $python)) { $python = (Get-Command python -ErrorAction Stop).Source }
 

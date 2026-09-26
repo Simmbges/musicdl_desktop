@@ -18,7 +18,11 @@ import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 
 ROOT = Path(sys.executable).resolve().parent if getattr(sys, 'frozen', False) else Path(__file__).resolve().parent
-DEFAULT_REPO = Path(sys._MEIPASS) / 'musicdl-master' if getattr(sys, 'frozen', False) else ROOT.parent.parent / 'musicdl-master'
+if getattr(sys, 'frozen', False):
+    DEFAULT_REPO = Path(sys._MEIPASS) / 'musicdl-master'
+else:
+    candidates = (ROOT.parent / 'musicdl-master', ROOT.parent.parent / 'musicdl-master')
+    DEFAULT_REPO = next((path for path in candidates if (path / 'musicdl' / 'musicdl.py').is_file()), candidates[0])
 SOURCES = {'网易云': 'NeteaseMusicClient', 'QQ音乐': 'QQMusicClient',
            '酷狗': 'KugouMusicClient', '酷我': 'KuwoMusicClient',
            '咪咕': 'MiguMusicClient', '千千': 'QianqianMusicClient',

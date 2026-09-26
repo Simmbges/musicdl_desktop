@@ -3,3 +3,10 @@ dist/
 *.spec
 build-log.txt
 .venv/
+__pycache__/
+*.pyc
+probe-cache/
+verification-downloads/
+validation-live.json
+settings.json
+下载音乐/

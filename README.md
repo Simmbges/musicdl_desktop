@@ -1,10 +1,16 @@
 # 拾音 · musicdl 桌面版
 
-双击 **start.cmd** 启动。已经为本机安装好独立 Python 环境。
+Windows 源码运行需要 Python 3.12 和原项目 [musicdl](https://github.com/CharlesPikachu/musicdl)。在本项目目录打开 PowerShell，执行：
 
-也可以直接运行 `dist\Shiyin.exe`。这是包含 Python、musicdl 源码和依赖的 Windows 64 位单文件版本，无需安装 Python 或保留原项目目录。首次启动需要等待解压。请将同目录的 `LICENSE-musicdl.txt` 与 EXE 一起保留。
+```powershell
+git clone https://github.com/CharlesPikachu/musicdl.git ..\musicdl-master
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r ..\musicdl-master\requirements.txt
+```
 
-通过 `start.cmd` 启动时，工具加载 `C:\Users\Simmb\Documents\code\musicdl-master` 中的原项目源码；没有覆盖原项目或已有的 music_finder。移动原项目后，请在界面“项目位置”中重新选择目录。EXE 版本使用打包时内置的源码。
+随后双击 **start.cmd** 启动。若已将原项目放在其他位置，可在界面点击“项目位置”选择；程序也兼容原项目位于本项目上两级目录的布局。运行后会在本地生成 `settings.json`，其中保存个人路径和偏好，不上传到仓库。
+
+运行 `build.ps1` 可在本地生成 `dist\Shiyin.exe`。单文件 EXE 包含 Python、musicdl 源码和依赖；首次启动需要等待解压，并应与同目录的 `LICENSE-musicdl.txt` 一起分发。
 
 ## 使用
 
@@ -41,8 +47,8 @@
 
 真实搜索及单首下载测试：`.venv\Scripts\python.exe -X utf8 verify.py --live`
 
-在线结果记录在 `validation-live.json`，测试下载在 `verification-downloads`。测试会真实联网。
+在线结果记录在本地 `validation-live.json`，测试下载在 `verification-downloads`；这些产物不会上传到仓库。测试会真实联网。
 
-需要重新打包时，在项目目录运行 `powershell -ExecutionPolicy Bypass -File .\build.ps1`，构建机需安装 PyInstaller。输出位于 `dist\Shiyin.exe`。源码方式启动时，其他电脑仍需 Python 3.10+（包含 tkinter）和原项目依赖。
+需要重新打包时，先运行 `.\.venv\Scripts\python.exe -m pip install pyinstaller`，再运行 `powershell -ExecutionPolicy Bypass -File .\build.ps1`。输出位于 `dist\Shiyin.exe`。源码方式启动需要 Python 3.12（包含 tkinter）和原项目依赖。
 
-源项目：CharlesPikachu/musicdl，原作者 Zhenchao Jin；原项目 LICENSE 和使用条件仍适用。这份工具用于个人本地使用，下载应遵守来源平台及作品授权条件。
+源项目：CharlesPikachu/musicdl，原作者 Zhenchao Jin；原项目许可见 [LICENSE-musicdl.txt](LICENSE-musicdl.txt)。这份工具用于个人本地使用，下载应遵守来源平台及作品授权条件。

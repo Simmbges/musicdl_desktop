@@ -41,15 +41,22 @@ class Checks(unittest.TestCase):
             self.assertEqual(first.read_bytes(), wav_bytes())
 
     def test_flac_tags_cover_and_lyrics(self):
+        import av
         from mutagen.flac import FLAC
         def chunk(kind, data):
             return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data))
         cover = (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', 1, 1, 8, 2, 0, 0, 0))
             + chunk(b'IDAT', zlib.compress(b'\x00\xff\x00\x00')) + chunk(b'IEND', b''))
         with tempfile.TemporaryDirectory() as folder:
-            source = next((Path(__file__).resolve().parent / 'verification-downloads').glob('Piano*.flac'))
             blank = Path(folder) / 'blank.flac'
-            blank.write_bytes(source.read_bytes())
+            with av.open(str(blank), 'w') as output:
+                stream = output.add_stream('flac', rate=8000)
+                stream.layout = 'mono'
+                frame = av.AudioFrame(format='s16', layout='mono', samples=8000)
+                frame.planes[0].update(b'\0\0' * 8000)
+                frame.sample_rate = 8000
+                for packet in stream.encode(frame): output.mux(packet)
+                for packet in stream.encode(None): output.mux(packet)
             audio = FLAC(blank)
             original_md5 = audio.info.md5_signature
             for key in ('TITLE', 'ARTIST', 'ALBUM'):
