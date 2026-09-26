@@ -12,6 +12,8 @@ py -3.12 -m venv .venv
 
 运行 `build.ps1` 可在本地生成 `dist\Shiyin.exe`。单文件 EXE 包含 Python、musicdl 源码和依赖；首次启动需要等待解压，并应与同目录的 `LICENSE-musicdl.txt` 一起分发。
 
+不想自行构建可从 [GitHub Releases](https://github.com/Simmbges/musicdl_desktop/releases) 下载 Windows 版 EXE 和对应的许可文件。
+
 ## 使用
 
 1. 输入歌名或歌手，勾选音源，按回车或点击“搜索音乐”。
