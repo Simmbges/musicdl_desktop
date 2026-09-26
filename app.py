@@ -111,7 +111,9 @@ class App:
         self.table = self.make_table(body, ['歌曲', '歌手', '专辑', '音质 / 格式', '时长', '预计大小', '来源'], [250, 160, 180, 120, 75, 85, 90], height=12)
         self.table.tag_configure('lossless', foreground='#087566')
         self.table.tag_configure('unavailable', foreground='#8a7770')
-        self.table.bind('<Double-1>', lambda _: self.begin_download())
+        self.table.bind('<Button-1>', self.toggle_result_selection)
+        self.table.bind('<Double-1>', self.toggle_result_selection)
+        self.table.bind('<<TreeviewSelect>>', lambda _: self.update_result_count())
         actions = ttk.Frame(body)
         actions.pack(fill='x', pady=10)
         self.download_button = ttk.Button(actions, text='下载最高无损', style='Accent.TButton', command=self.begin_download)
@@ -119,7 +121,9 @@ class App:
         self.quality_button = ttk.Button(actions, text='选择音质…', command=self.begin_choose_quality)
         self.quality_button.pack(side='left', padx=(8, 0))
         ttk.Button(actions, text='全选当前结果', command=lambda: self.table.selection_set(self.table.get_children())).pack(side='left', padx=8)
-        ttk.Label(actions, text='可多选一键下载 · 双击下载最高无损').pack(side='left', padx=8)
+        self.clear_selection_button = ttk.Button(actions, text='取消全部选择', command=self.clear_result_selection)
+        self.clear_selection_button.pack(side='left')
+        ttk.Label(actions, text='单击选中 · 再点取消 · 可批量下载').pack(side='left', padx=8)
         ttk.Button(actions, text='项目位置', command=self.choose_repo).pack(side='right')
         savebar = ttk.Frame(body)
         savebar.pack(fill='x', pady=(0, 10))
@@ -275,6 +279,7 @@ class App:
             return
         self.limit.set(str(catalog_limit))
         self.save_settings()
+        if self.table.selection(): self.table.selection_remove(*self.table.selection())
         mode = self.search_mode.get()
         resolve_limit = min(5, catalog_limit) if mode == '快速搜索' else catalog_limit
         cache_key = (str(Path(self.repo).resolve()), keyword.casefold(), tuple(sources), mode, catalog_limit)
@@ -317,14 +322,37 @@ class App:
         self.mode_help.set(text)
 
     def rebuild_rows(self):
+        selected_keys = {self.row_key(self.rows[int(i)]) for i in self.table.selection() if int(i) < len(self.rows)}
         self.rows = [song for source in SOURCES for song in self.source_rows.get(source, [])]
-        self.render()
+        self.render(selected_keys)
         if self.busy: self.set_busy(True)
 
-    def render(self):
+    def row_key(self, song):
+        return (song.get('source'), song.get('identifier'), song.get('song_name'),
+            song.get('singers'), song.get('album'))
+
+    def toggle_result_selection(self, event):
+        if self.table.identify_region(event.x, event.y) != 'cell': return
+        item_id = self.table.identify_row(event.y)
+        if not item_id: return 'break'
+        if item_id in self.table.selection(): self.table.selection_remove(item_id)
+        else: self.table.selection_add(item_id)
+        self.table.focus(item_id)
+        self.update_result_count()
+        return 'break'
+
+    def clear_result_selection(self):
+        selected = self.table.selection()
+        if selected: self.table.selection_remove(*selected)
+        self.update_result_count()
+
+    def render(self, selected_keys=None):
+        if selected_keys is None:
+            selected_keys = {self.row_key(self.rows[int(i)]) for i in self.table.selection() if int(i) < len(self.rows)}
         self.table.delete(*self.table.get_children())
         is_lossless = lambda song: lossless(song) or bool(song.get('catalog_lossless'))
         indexes = sorted(range(len(self.rows)), key=lambda i: not is_lossless(self.rows[i]))
+        selected_ids = []
         for i in indexes:
             s = self.rows[i]
             if self.only_lossless.get() and not is_lossless(s): continue
@@ -336,9 +364,15 @@ class App:
                 if s.get('catalog_lossless') and not lossless(s): quality += ' · 目录有 FLAC'
             tags = ('lossless',) if is_lossless(s) else (('unavailable',) if not downloadable else ())
             self.table.insert('', 'end', iid=str(i), values=[s.get('song_name'), s.get('singers'), s.get('album'), quality, s.get('duration'), s.get('file_size'), s['source']], tags=tags)
+            if self.row_key(s) in selected_keys: selected_ids.append(str(i))
+        if selected_ids: self.table.selection_set(*selected_ids)
+        self.update_result_count()
+
+    def update_result_count(self):
+        is_lossless = lambda song: lossless(song) or bool(song.get('catalog_lossless'))
         direct = sum(s.get('downloadable', True) for s in self.rows)
         resolvable = sum(bool(s.get('catalog_item')) and not s.get('downloadable', True) for s in self.rows)
-        self.count.set(f"显示 {len(self.table.get_children())} / {len(self.rows)} 首 · 可下载 {direct + resolvable} 首（待解析 {resolvable}）· 无损 {sum(is_lossless(s) for s in self.rows)} 首")
+        self.count.set(f"显示 {len(self.table.get_children())} / {len(self.rows)} 首 · 已选 {len(self.table.selection())} 首 · 可下载 {direct + resolvable} 首（待解析 {resolvable}）· 无损 {sum(is_lossless(s) for s in self.rows)} 首")
 
     def update_sources(self):
         self.source_label.configure(text='  /  '.join(f'{s}：{v}' for s, v in self.source_status.items()))

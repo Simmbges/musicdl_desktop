@@ -257,6 +257,13 @@ class Checks(unittest.TestCase):
         app.poll()
         root.update()
         self.assertEqual(len(app.table.get_children()), 1)
+        click = types.SimpleNamespace(x=1, y=1)
+        with patch.object(app.table, 'identify_region', return_value='cell'), \
+             patch.object(app.table, 'identify_row', return_value='0'):
+            app.toggle_result_selection(click)
+            self.assertEqual(app.table.selection(), ('0',))
+            app.toggle_result_selection(click)
+            self.assertEqual(app.table.selection(), ())
         app.rows.append(dict(song, ext='mp3'))
         app.only_lossless.set(True)
         app.render()
@@ -270,6 +277,24 @@ class Checks(unittest.TestCase):
         self.assertEqual(len(app.table.get_children()), 2)
         self.assertEqual(str(app.download_button['state']), 'normal')
         self.assertEqual('无损 · FLAC', app.table.set(str(app.rows.index(catalog)), 3))
+        first, second = app.table.get_children()
+        with patch.object(app.table, 'identify_region', return_value='cell'), \
+             patch.object(app.table, 'identify_row', side_effect=[first, second, first]):
+            app.toggle_result_selection(click)
+            app.toggle_result_selection(click)
+            self.assertEqual(set(app.table.selection()), {first, second})
+            app.operation = None
+            app.set_busy(False)
+            with patch.object(app, 'save_settings'), patch.object(app, 'start_download') as start_download:
+                app.begin_download()
+            self.assertEqual(len(start_download.call_args.args[0]), 2)
+            app.operation = 'search'
+            app.set_busy(True)
+            app.toggle_result_selection(click)
+            self.assertEqual(app.table.selection(), (second,))
+        app.clear_selection_button.invoke()
+        self.assertEqual(app.table.selection(), ())
+        self.assertIn('已选 0 首', app.count.get())
         app.table.selection_set(str(app.rows.index(catalog)))
         with patch.object(app, 'save_settings'):
             app.begin_download()
@@ -294,6 +319,7 @@ class Checks(unittest.TestCase):
         app.events.put(('source', ('QQ音乐', [], '超时，请稍后重试')))
         app.poll()
         self.assertEqual(len(app.table.get_children()), 2)
+        self.assertEqual(app.table.selection(), (str(app.rows.index(catalog)),))
         self.assertEqual(app.source_rows['QQ音乐'][0]['identifier'], 'catalog-mid')
         self.assertIn('链接解析失败', app.source_status['QQ音乐'])
         app.events.put(('source', ('QQ音乐', [dict(song, source='QQ音乐')], '1 首可下载')))
